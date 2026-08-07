@@ -184,11 +184,25 @@ def _check_twenty_config() -> Check:
     base_url = os.environ.get("BLOY_TWENTY_BASE_URL", "").strip()
     api_key = os.environ.get("BLOY_TWENTY_API_KEY", "").strip()
     if base_url and api_key:
+        # Configured is not the same as reachable: prove the key works rather
+        # than reporting green on the presence of two environment variables.
+        from bloy_dev_agent.features.twenty.client import TwentyClient, TwentyError
+
+        try:
+            TwentyClient(base_url=base_url, api_key=api_key).ping()
+        except TwentyError as exc:
+            return Check(
+                key="twenty",
+                label="Twenty connection",
+                state=FAIL,
+                detail=f"{base_url} — {exc.message}",
+                why="Check the API key, its role, and the firewall allowlist.",
+            )
         return Check(
             key="twenty",
             label="Twenty connection",
             state=OK,
-            detail=f"Configured for {base_url}",
+            detail=f"Authenticated against {base_url}",
         )
     missing = [
         name
