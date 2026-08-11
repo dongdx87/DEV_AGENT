@@ -21,15 +21,45 @@ from __future__ import annotations
 import json
 import os
 import sys
+from pathlib import Path
 
 from bloy_dev_agent.features.twenty.client import TwentyClient, TwentyError
 
 
+def _load_project_env() -> None:
+    """Read agent-manager's .env so the key lives in one place only.
+
+    The app itself calls ``load_dotenv()`` in ``core.config``; this script runs
+    outside that process, so it repeats the step rather than asking the
+    operator to export the same values a second time.
+    """
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return
+
+    # The plugin is normally installed as a symlink into community_plugins/,
+    # so resolving __file__ walks out of the install tree entirely. Search up
+    # from the working directory (the script is run from the project root)
+    # and from the unresolved script path, taking the first .env found.
+    here = Path(__file__)
+    candidates = [Path.cwd(), *Path.cwd().parents, *here.parents]
+    for directory in candidates:
+        env_file = directory / ".env"
+        if env_file.is_file():
+            load_dotenv(env_file)
+            return
+
+
 def main() -> int:
+    _load_project_env()
     base_url = os.environ.get("BLOY_TWENTY_BASE_URL", "").strip()
     api_key = os.environ.get("BLOY_TWENTY_API_KEY", "").strip()
     if not base_url or not api_key:
-        print("Set BLOY_TWENTY_BASE_URL and BLOY_TWENTY_API_KEY first.")
+        print(
+            "Set BLOY_TWENTY_BASE_URL and BLOY_TWENTY_API_KEY — either in the\n"
+            "agent-manager .env or as environment variables for this command."
+        )
         return 2
 
     client = TwentyClient(base_url=base_url, api_key=api_key)

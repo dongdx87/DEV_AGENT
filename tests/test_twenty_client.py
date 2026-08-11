@@ -192,7 +192,7 @@ METADATA_PAYLOAD = {
                         "nameSingular": "issue",
                         "namePlural": "issues",
                         "labelSingular": "Issue",
-                        "isCustom": True,
+                        "isSystem": False,
                         "isActive": True,
                         "fields": {
                             "edges": [
@@ -208,7 +208,7 @@ METADATA_PAYLOAD = {
                         "nameSingular": "archivedThing",
                         "namePlural": "archivedThings",
                         "labelSingular": "Archived",
-                        "isCustom": True,
+                        "isSystem": False,
                         "isActive": False,
                         "fields": {"edges": []},
                     }

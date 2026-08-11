@@ -221,6 +221,10 @@ class TwentyClient:
     # -- metadata ----------------------------------------------------------
 
     #: Enough of the schema to let an operator map objects/fields in settings.
+    #:
+    #: Field selection follows ``ObjectMetadataDTO`` / ``FieldMetadataDTO``:
+    #: there is no ``isCustom`` on objects in current Twenty — ``isSystem``
+    #: is the flag that separates workspace-authored objects from built-ins.
     _OBJECTS_QUERY = """
     query PluginObjectMetadata {
       objects(paging: { first: 200 }) {
@@ -229,10 +233,10 @@ class TwentyClient:
             nameSingular
             namePlural
             labelSingular
-            isCustom
+            isSystem
             isActive
             fields(paging: { first: 200 }) {
-              edges { node { name type isActive } }
+              edges { node { name label type isActive isSystem } }
             }
           }
         }
@@ -279,7 +283,9 @@ class TwentyClient:
                     name_singular=node.get("nameSingular") or "",
                     name_plural=node.get("namePlural") or "",
                     label_singular=node.get("labelSingular") or "",
-                    is_custom=bool(node.get("isCustom")),
+                    # Twenty reports built-ins as system objects; anything the
+                    # workspace added itself is what we call custom here.
+                    is_custom=not bool(node.get("isSystem")),
                     fields=fields,
                 )
             )
