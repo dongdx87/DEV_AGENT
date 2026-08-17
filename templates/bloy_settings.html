@@ -1,0 +1,114 @@
+{% extends "base.html" %}
+
+{% set input_cls = "w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/30 focus:border-indigo-500" %}
+
+{% macro field(name, label, value, help, placeholder="") %}
+<div>
+  <label for="{{ name }}" class="block text-sm font-medium text-slate-800">{{ label }}</label>
+  <input id="{{ name }}" name="{{ name }}" type="text" value="{{ value }}"
+         placeholder="{{ placeholder }}" class="mt-1 {{ input_cls }}">
+  <p class="mt-1 text-xs text-slate-500">{{ help }}</p>
+</div>
+{% endmacro %}
+
+{% block content %}
+<div class="max-w-3xl mx-auto space-y-5">
+
+  <div class="bg-white rounded-2xl shadow-sm border border-slate-200 p-6">
+    <nav class="text-xs text-slate-500">
+      <a href="/" class="hover:text-indigo-600">BLOY Dev Agent</a>
+      <span class="px-1">/</span><span>Settings</span>
+    </nav>
+    <h1 class="mt-1 text-2xl font-semibold tracking-tight text-slate-900">Cấu hình agent</h1>
+    <p class="mt-1 text-sm text-slate-500 max-w-prose">
+      Áp dụng cho mọi lượt chạy, kể cả khi pipeline được gọi ngoài routine. Riêng
+      từng routine vẫn có thể ghi đè ở trang
+      <a href="{{ bam_url }}/agent-routine" class="text-indigo-600 hover:text-indigo-500">Agent Routine</a>.
+    </p>
+  </div>
+
+  <form method="post" action="/settings" class="space-y-5">
+
+    {# ---------- cost guard ---------- #}
+    <section class="rounded-2xl border border-amber-300 bg-amber-50/50 shadow-sm p-5">
+      <h2 class="text-base font-semibold text-amber-900">Chặn chi phí</h2>
+      <p class="mt-1 text-sm text-amber-800 max-w-prose">
+        Agent không được chạy vô hạn. Một issue thất bại đủ số lần dưới đây thì bị
+        dừng hẳn và chuyển sang cột blocked — phải có người bấm Reset mới chạy lại.
+      </p>
+      <div class="mt-4 max-w-xs">
+        <label for="max_attempts" class="block text-sm font-medium text-amber-900">
+          Số lần thử tối đa mỗi issue
+        </label>
+        <input id="max_attempts" name="max_attempts" type="number" min="1" max="20"
+               value="{{ max_attempts }}"
+               class="mt-1 w-full rounded-lg border border-amber-300 bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-amber-500/30 focus:border-amber-500">
+        <p class="mt-1 text-xs text-amber-700">
+          Chỉ đếm lượt <span class="font-medium">failed</span>. Đặt 0 hoặc bỏ trống thì
+          dùng mặc định 5.
+        </p>
+      </div>
+    </section>
+
+    {# ---------- source ---------- #}
+    <section class="rounded-2xl border border-slate-200 bg-white shadow-sm p-5 space-y-4">
+      <div>
+        <h2 class="text-base font-semibold text-slate-900">Nguồn task</h2>
+        <p class="text-sm text-slate-500">Board Twenty mà agent lấy việc từ đó.</p>
+      </div>
+      {{ field("project_id", "Twenty project id",
+               settings.get("project_id", ""),
+               "UUID của project. Lấy từ URL board.") }}
+      <div>
+        <label for="target_repo" class="block text-sm font-medium text-slate-800">Repo đích</label>
+        <select id="target_repo" name="target_repo" class="mt-1 {{ input_cls }}">
+          <option value="">— mặc định —</option>
+          {% for repo in repos %}
+            <option value="{{ repo }}" {% if settings.get("target_repo") == repo %}selected{% endif %}>{{ repo }}</option>
+          {% endfor %}
+        </select>
+        <p class="mt-1 text-xs text-slate-500">Sub-project mà worktree được tách ra từ đó.</p>
+      </div>
+      {{ field("timeout_minutes", "Timeout sandbox (phút)",
+               settings.get("timeout_minutes", ""),
+               "Quá thời gian này thì sandbox bị dừng. Mặc định 30.", "30") }}
+    </section>
+
+    {# ---------- columns ---------- #}
+    <section class="rounded-2xl border border-slate-200 bg-white shadow-sm p-5 space-y-4">
+      <div>
+        <h2 class="text-base font-semibold text-slate-900">Cột trạng thái</h2>
+        <p class="text-sm text-slate-500 max-w-prose">
+          Tên cột phải khớp chính xác với Twenty. Cột blocked cố ý khác cột nguồn —
+          nếu trả issue bị chặn về đúng cột nguồn, lượt sau lại nhặt lên rồi lại chặn,
+          thành vòng lặp không làm gì.
+        </p>
+      </div>
+      <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
+        {{ field("source_status", "Lấy issue từ", settings.get("source_status", ""), "Cột chứa việc chờ làm.", "Todo") }}
+        {{ field("working_status", "Đang chạy", settings.get("working_status", ""), "Claim trước khi chạy để không nhặt trùng.", "In Progress") }}
+        {{ field("done_status", "Thành công", settings.get("done_status", ""), "Có merge request thì chuyển vào đây.", "In Review") }}
+        {{ field("error_status", "Thất bại", settings.get("error_status", ""), "Còn lượt thử thì quay về đây.", "Todo") }}
+        {{ field("blocked_status", "Bị chặn", settings.get("blocked_status", ""), "Hết lượt thử thì nằm đây, chờ người xem.", "Backlog") }}
+      </div>
+    </section>
+
+    <div class="flex items-center gap-2">
+      <button type="submit"
+        class="inline-flex items-center justify-center rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/40">
+        Lưu cấu hình
+      </button>
+      <a href="/"
+         class="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50 focus:outline-none focus:ring-2 focus:ring-indigo-500/30">
+        Huỷ
+      </a>
+    </div>
+  </form>
+
+  <p class="text-xs text-slate-400">
+    Môi trường: {{ counts.get('ok', 0) }} ok · {{ counts.get('warn', 0) }} warn ·
+    {{ counts.get('fail', 0) }} fail —
+    <a href="/preflight" class="text-indigo-600 hover:text-indigo-500">xem preflight</a>
+  </p>
+</div>
+{% endblock %}

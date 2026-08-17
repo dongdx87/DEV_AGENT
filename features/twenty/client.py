@@ -38,6 +38,12 @@ MAX_RECORDS_PER_REQUEST = 60
 
 DEFAULT_TIMEOUT_SECONDS = 15.0
 
+#: How many times a transport failure is retried. Twenty answers slowly for a
+#: minute or two after a restart, and losing a run to that is losing a paid
+#: attempt for no work done.
+TRANSPORT_ATTEMPTS = 3
+TRANSPORT_BACKOFF_SECONDS = 2.0
+
 
 class TwentyError(Exception):
     """A Twenty call failed. ``message`` is safe to show to an operator."""
@@ -121,17 +127,34 @@ class TwentyClient:
         params: dict | None = None,
         json_body: dict | None = None,
     ) -> Any:
-        self._bucket.take()
         url = f"{self._base_url}{path}"
-        try:
-            with httpx.Client(
-                timeout=self._timeout, transport=self._transport
-            ) as client:
-                response = client.request(
-                    method, url, params=params, json=json_body, headers=self._headers
-                )
-        except httpx.RequestError as exc:
-            raise TwentyError(f"Could not reach Twenty: {exc}") from exc
+        last: httpx.RequestError | None = None
+
+        # Retry transport failures. Twenty is slow for a while after a restart,
+        # and a single 15-second timeout on the claim used to fail a whole run —
+        # burning one of the five paid attempts on a network blip. Every call
+        # here is idempotent (GET, or a PATCH that sets a field to a fixed
+        # value), so repeating one cannot double-apply anything.
+        for attempt in range(TRANSPORT_ATTEMPTS):
+            self._bucket.take()
+            try:
+                with httpx.Client(
+                    timeout=self._timeout, transport=self._transport
+                ) as client:
+                    response = client.request(
+                        method, url, params=params, json=json_body, headers=self._headers
+                    )
+                break
+            except httpx.RequestError as exc:
+                last = exc
+                if attempt + 1 < TRANSPORT_ATTEMPTS:
+                    logger.warning(
+                        "bloy_dev_agent: %s %s failed (%s), retrying %d/%d",
+                        method, path, exc, attempt + 2, TRANSPORT_ATTEMPTS,
+                    )
+                    time.sleep(TRANSPORT_BACKOFF_SECONDS * (attempt + 1))
+        else:
+            raise TwentyError(f"Could not reach Twenty: {last}") from last
 
         if response.status_code == 401:
             raise TwentyError("Twenty rejected the API key (401)", status_code=401)

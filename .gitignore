@@ -6,3 +6,14 @@ __pycache__/
 
 # Local secrets
 .env
+
+# The service's own database. It holds run history — real ticket titles, merchant
+# domains and agent output — so it is operational data, never source.
+db/
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+
+# Agent reasoning logs, written next to the worktrees rather than here, but
+# ignored in case a run is ever pointed at the repo.
+.bloy-logs/

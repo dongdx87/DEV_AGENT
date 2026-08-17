@@ -252,3 +252,162 @@ def test_record_url_uses_the_show_page_path():
         client.record_url("issue", "abc-123")
         == f"{BASE_URL}/object/issue/abc-123"
     )
+
+
+# ---------------------------------------------------------------------------
+# The key humans use wins over the key Twenty mints
+# ---------------------------------------------------------------------------
+
+
+def test_a_ticket_key_in_the_title_becomes_the_branch_key():
+    """Twenty numbers issues itself, but the branch must match the real ticket.
+
+    The board carries upstream tickets whose key lives in the title (BLS-1064),
+    while Twenty mints its own sequence (BLOY-4). Naming the branch after
+    Twenty's key would make it unfindable by the name anyone actually uses.
+    """
+    from bloy_dev_agent.features import workspace
+    from bloy_dev_agent.features.twenty import mapping
+
+    issue = mapping.normalize_issue(
+        {
+            "id": "x",
+            "issueKey": "BLOY-4",
+            "title": "BLS-1064: Chỉ load translation của published language",
+        }
+    )
+
+    assert issue.key == "BLS-1064"
+    assert issue.record_key == "BLOY-4", "Twenty's key stays traceable"
+    assert issue.title == "Chỉ load translation của published language"
+    assert workspace.branch_name(issue.key) == "bloy/bls-1064"
+
+
+def test_twenty_own_key_is_used_when_the_title_has_none():
+    from bloy_dev_agent.features.twenty import mapping
+
+    issue = mapping.normalize_issue(
+        {"id": "x", "issueKey": "BLOY-7", "title": "Sửa lỗi tính điểm"}
+    )
+
+    assert issue.key == "BLOY-7"
+    assert issue.title == "Sửa lỗi tính điểm"
+
+
+@pytest.mark.parametrize(
+    ("title", "expected"),
+    [
+        ("BLS-1064: a", "BLS-1064"),
+        ("BLS-1064 - a", "BLS-1064"),
+        ("bls-1064: a", ""),          # lowercase is prose, not a key
+        ("Fix BLS-1064 later", ""),   # must be a prefix, not a mention
+        ("A-1: a", ""),               # one-letter project keys are too loose
+        ("", ""),
+    ],
+)
+def test_only_a_real_key_prefix_is_taken(title, expected):
+    from bloy_dev_agent.features.twenty import mapping
+
+    assert mapping.split_title_key(title)[0] == expected
+
+
+def test_the_prompt_is_not_indented_like_a_code_block():
+    """dedent must run before interpolation, not after.
+
+    The ticket body contains lines at column zero, so the common prefix across
+    the interpolated string is empty and ``dedent`` strips nothing — leaving
+    every framing line indented eight spaces, which reads as a code block
+    rather than instructions. Observed on a live run.
+    """
+    from bloy_dev_agent.features.twenty import mapping
+
+    issue = mapping.normalize_issue(
+        {
+            "id": "x",
+            "issueKey": "BLOY-6",
+            "title": "BLS-1066: Exclude Gift Card",
+            "description": "Dòng ở cột 0\nDòng thứ hai cũng vậy",
+        }
+    )
+
+    prompt = mapping.build_prompt(issue, "/worktrees/x", implement=True, monorepo="/monorepo")
+
+    framing = [
+        line
+        for line in prompt.splitlines()
+        if line.startswith("You are working") or line.startswith("Ticket ")
+    ]
+    assert framing, "framing lines should be present"
+    for line in framing:
+        assert not line.startswith(" "), f"indented framing line: {line!r}"
+
+
+# ---------------------------------------------------------------------------
+# Transport retry
+# ---------------------------------------------------------------------------
+
+
+def test_a_transient_timeout_is_retried_then_succeeds(monkeypatch):
+    """Twenty answers slowly for a minute after a restart; one blip is not fatal."""
+    from bloy_dev_agent.features.twenty import client as mod
+
+    monkeypatch.setattr(mod.time, "sleep", lambda _s: None)
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise httpx.ReadTimeout("timed out", request=request)
+        return httpx.Response(200, json={"data": {"issues": []}})
+
+    c = TwentyClient(
+        base_url="http://twenty.test",
+        api_key="k",
+        transport=httpx.MockTransport(handler),
+    )
+
+    assert c.list_records("issues") == []
+    assert calls["n"] == 2, "should have retried exactly once"
+
+
+def test_a_persistent_outage_still_raises(monkeypatch):
+    from bloy_dev_agent.features.twenty import client as mod
+
+    monkeypatch.setattr(mod.time, "sleep", lambda _s: None)
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        raise httpx.ConnectError("refused", request=request)
+
+    c = TwentyClient(
+        base_url="http://twenty.test",
+        api_key="k",
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(TwentyError, match="Could not reach Twenty"):
+        c.list_records("issues")
+    assert calls["n"] == mod.TRANSPORT_ATTEMPTS
+
+
+def test_an_http_error_is_not_retried(monkeypatch):
+    """A 403 will not become a 200; retrying only wastes the rate-limit budget."""
+    from bloy_dev_agent.features.twenty import client as mod
+
+    monkeypatch.setattr(mod.time, "sleep", lambda _s: None)
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(403)
+
+    c = TwentyClient(
+        base_url="http://twenty.test",
+        api_key="k",
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(TwentyError):
+        c.list_records("issues")
+    assert calls["n"] == 1

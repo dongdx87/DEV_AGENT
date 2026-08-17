@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="vi" class="h-full">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}{{ title or "BLOY Dev Agent" }}{% endblock %}</title>
+
+  {# Same font and Tailwind setup as the BAM admin, so the two consoles read as
+     one product even though they are now separate servers. #}
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet"
+        href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600;9..40,700&display=swap">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: { sans: ['"DM Sans"', 'system-ui', 'sans-serif'] },
+          colors: {
+            surface: { DEFAULT: '#fafafa', muted: '#f4f4f5' },
+            ink: { DEFAULT: '#18181b', muted: '#71717a' },
+            accent: { DEFAULT: '#0ea5e9', hover: '#0284c7', soft: '#e0f2fe' },
+            sidebar: { bg: '#0c0c0e', hover: '#18181b', active: '#27272a', border: '#27272a' },
+          },
+          boxShadow: {
+            sleek: '0 1px 2px rgba(0,0,0,0.04), 0 4px 16px rgba(0,0,0,0.06)',
+          },
+        },
+      },
+    }
+  </script>
+  <style>body { font-feature-settings: "ss01" on, "cv01" on; }</style>
+  {% block head %}{% endblock %}
+</head>
+
+<body class="h-full bg-surface font-sans text-ink antialiased">
+<div class="flex min-h-full">
+
+  <aside class="hidden w-64 shrink-0 flex-col bg-sidebar-bg text-slate-300 lg:flex">
+    <div class="flex items-center gap-3 border-b border-sidebar-border px-5 py-4">
+      <div class="flex h-9 w-9 items-center justify-center rounded-lg bg-accent/15 text-accent">
+        <svg class="h-5 w-5" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round"
+                d="M9 3v2m6-2v2M4 8h16M6 8v10a2 2 0 002 2h8a2 2 0 002-2V8M10 12h4"/>
+        </svg>
+      </div>
+      <div>
+        <p class="text-sm font-semibold text-white">BLOY Dev Agent</p>
+        <p class="text-xs text-ink-muted">service riêng · port {{ port }}</p>
+      </div>
+    </div>
+
+    <nav class="flex-1 space-y-1 px-3 py-4 text-sm">
+      {% set nav = [
+        ("/", "Dashboard"),
+        ("/settings", "Settings"),
+        ("/preflight", "Preflight"),
+      ] %}
+      {% for href, label in nav %}
+        {% set active = (request.url.path == href) or (href != "/" and request.url.path.startswith(href)) %}
+        <a href="{{ href }}"
+           class="block rounded-lg px-3 py-2 transition
+                  {% if active %}bg-sidebar-active text-white{% else %}hover:bg-sidebar-hover hover:text-white{% endif %}">
+          {{ label }}
+        </a>
+      {% endfor %}
+
+      <p class="px-3 pt-5 pb-1 text-[11px] font-semibold uppercase tracking-wide text-ink-muted">Liên kết</p>
+      <a href="{{ bam_url }}" class="block rounded-lg px-3 py-2 hover:bg-sidebar-hover hover:text-white">
+        BAM console ↗
+      </a>
+      <a href="{{ bam_url }}/agent-routine" class="block rounded-lg px-3 py-2 hover:bg-sidebar-hover hover:text-white">
+        Agent Routine ↗
+      </a>
+    </nav>
+
+    <p class="border-t border-sidebar-border px-5 py-3 text-[11px] text-ink-muted">
+      Chạy độc lập với BAM — restart BAM không giết run đang chạy.
+    </p>
+  </aside>
+
+  <main class="flex-1 overflow-x-hidden px-4 py-6 sm:px-6 lg:px-8">
+    {% block content %}{% endblock %}
+  </main>
+</div>
+{% block scripts %}{% endblock %}
+</body>
+</html>

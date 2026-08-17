@@ -1,32 +1,30 @@
-"""Environment checks for the BLOY Dev Agent plugin.
+"""Environment checks for the standalone BLOY Dev Agent service.
 
-The plan for this plugin rests on assumptions about the host: that agent_team
-is reachable, that our own table was created, that the routine scheduler is
-available to drive the Twenty sync. Rather than trusting the design document,
-this module answers each question against the running process and renders the
-result on a page.
+The service rests on assumptions about the host: that its own tables exist,
+that a Claude CLI is reachable, that the sandbox server answers, that the
+worktree root is writable, and that Twenty responds to its key. Rather than
+trusting the design document, each question is answered against the running
+process and rendered on a page.
+
+Checks that used to look for BAM plugins are gone. In a separate process
+``ai_code``, the routine scheduler and the BAM agent row are simply not
+reachable, so reporting on them said nothing about whether a run would work.
+BAM is now checked as one optional integration among others.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-import sys
+import shutil
 from dataclasses import dataclass
-
-from bloy_dev_agent.features.bridge import agent_team as bridge
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 OK = "ok"
 WARN = "warn"
 FAIL = "fail"
-
-#: Plugin that provides the routine scheduler we want to run the sync on.
-ROUTINE_PLUGIN = "agent_routine"
-
-#: Table this plugin owns; created by db_migrations/001 and models.py.
-LINK_TABLE = "plugin_bloy_twenty_task_link"
 
 
 @dataclass
@@ -40,170 +38,188 @@ class Check:
     why: str = ""
 
 
-def _plugin_names() -> list[str]:
+# ---------------------------------------------------------------------------
+# Individual checks
+# ---------------------------------------------------------------------------
+
+
+def _check_database() -> Check:
+    from sqlalchemy import inspect
+
+    from bloy_dev_agent.db import database_url, engine
+    from bloy_dev_agent.models import BloyPipelineRun, BloySetting
+
+    wanted = {BloyPipelineRun.__tablename__, BloySetting.__tablename__}
     try:
-        from core.plugin_sdk.registry import get_registry
-
-        return sorted(get_registry().plugins)
-    except Exception:  # noqa: BLE001
-        logger.exception("bloy_dev_agent: cannot list plugins")
-        return []
-
-
-def _check_agent_team() -> list[Check]:
-    status = bridge.status()
-    checks: list[Check] = []
-
-    if not status.installed:
-        checks.append(
-            Check(
-                key="agent_team",
-                label="agent_team plugin",
-                state=FAIL,
-                detail="Not installed in this Agent Manager instance.",
-                why=(
-                    "Sync targets an Agent Team board. Without it this plugin "
-                    "can still load, but has nowhere to put tasks."
-                ),
-            )
-        )
-        return checks
-
-    checks.append(
-        Check(
-            key="agent_team",
-            label="agent_team plugin",
-            state=OK if status.enabled else WARN,
-            detail=(
-                f"Installed v{status.version}, "
-                f"{'enabled' if status.enabled else 'DISABLED'}."
-            ),
-            why="" if status.enabled else "Enable it on the Plugins page.",
-        )
-    )
-
-    exposed = [key for key, present in status.services.items() if present]
-    missing = [key for key, present in status.services.items() if not present]
-    checks.append(
-        Check(
-            key="agent_team_services",
-            label="agent_team services()",
-            state=OK if not missing else WARN,
-            detail=(
-                f"Exposed: {', '.join(exposed) or 'none'}"
-                + (f" · missing: {', '.join(missing)}" if missing else "")
-            ),
-            why=(
-                ""
-                if not missing
-                else (
-                    "The supported cross-plugin channel. Until agent_team "
-                    "exposes these, the bridge falls back to importing their "
-                    "internals, which breaks on their refactors."
-                )
-            ),
-        )
-    )
-
-    checks.append(
-        Check(
-            key="agent_team_import",
-            label="Fallback: import agent_team",
-            state=OK if status.importable else FAIL,
-            detail=(
-                "Importable — community_plugins is on sys.path."
-                if status.importable
-                else f"Not importable. {status.import_error}"
-            ),
-            why=(
-                ""
-                if status.importable
-                else "With no services and no import, the bridge has no channel."
-            ),
-        )
-    )
-
-    checks.append(
-        Check(
-            key="agent_team_channel",
-            label="Active bridge channel",
-            state=OK if status.usable else FAIL,
-            detail=status.channel,
-        )
-    )
-    return checks
-
-
-def _check_link_table() -> Check:
-    try:
-        from sqlalchemy import inspect
-
-        from core.database.base import engine
-
-        exists = inspect(engine).has_table(LINK_TABLE)
+        found = set(inspect(engine).get_table_names())
     except Exception as exc:  # noqa: BLE001
         return Check(
-            key="link_table",
-            label="Link table",
+            key="database",
+            label="Database riêng",
             state=FAIL,
-            detail=f"Could not inspect the database: {type(exc).__name__}: {exc}",
+            detail=f"Không đọc được: {type(exc).__name__}: {exc}",
+            why="Service tự giữ DB của nó, không dùng chung với BAM.",
+        )
+
+    missing = sorted(wanted - found)
+    return Check(
+        key="database",
+        label="Database riêng",
+        state=OK if not missing else FAIL,
+        detail=(
+            f"{database_url()}"
+            if not missing
+            else f"Thiếu bảng: {', '.join(missing)}"
+        ),
+        why="" if not missing else "init_db() chạy lúc boot — xem log khởi động.",
+    )
+
+
+def find_claude_binary() -> str:
+    """Locate the Claude CLI on the host that mounts it into the sandbox."""
+    configured = os.environ.get("BLOY_CLAUDE_BIN", "").strip()
+    if configured and Path(configured).exists():
+        return configured
+    found = shutil.which("claude")
+    if found:
+        return found
+    # nvm installs it per node version and never puts it on a service's PATH.
+    matches = sorted(Path.home().glob(".nvm/versions/node/*/bin/claude"))
+    return str(matches[-1]) if matches else ""
+
+
+def _check_claude() -> Check:
+    binary = find_claude_binary()
+    return Check(
+        key="claude_cli",
+        label="Claude CLI",
+        state=OK if binary else FAIL,
+        detail=binary or "Không tìm thấy trên PATH hay dưới nvm.",
+        why=(
+            ""
+            if binary
+            else "Đặt BLOY_CLAUDE_BIN. Sandbox mount thư mục nvm này vào container."
+        ),
+    )
+
+
+def _check_claude_login() -> Check:
+    """The container copies this login in; without it the CLI exits at once."""
+    config = Path.home() / ".claude.json"
+    creds = Path.home() / ".claude" / ".credentials.json"
+    if config.exists() and config.stat().st_size > 0:
+        return Check(
+            key="claude_login",
+            label="Claude login",
+            state=OK,
+            detail=f"{config} ({config.stat().st_size // 1024} KB)",
         )
     return Check(
-        key="link_table",
-        label="Link table",
-        state=OK if exists else FAIL,
-        detail=(
-            f"{LINK_TABLE} exists."
-            if exists
-            else f"{LINK_TABLE} is missing — did db_migrations run?"
-        ),
-        why="" if exists else "Check the startup log for migration errors.",
-    )
-
-
-def _check_routine_plugin() -> Check:
-    names = _plugin_names()
-    present = ROUTINE_PLUGIN in names
-    return Check(
-        key="routine",
-        label="Routine scheduler",
-        state=OK if present else WARN,
-        detail=(
-            f"{ROUTINE_PLUGIN} is loaded."
-            if present
-            else f"{ROUTINE_PLUGIN} not found."
-        ),
+        key="claude_login",
+        label="Claude login",
+        state=FAIL,
+        detail=f"{config} không tồn tại hoặc rỗng.",
         why=(
-            "The Twenty sync runs as a RoutineAction on this scheduler "
-            "instead of a hand-rolled background ticker."
+            "File này nằm CẠNH ~/.claude chứ không nằm trong, nên phải đẩy riêng "
+            "vào sandbox. Thiếu nó thì CLI báo 'configuration file not found'."
+            + ("" if creds.exists() else " Chạy `claude` một lần để đăng nhập.")
         ),
     )
 
 
-def _check_twenty_config() -> Check:
+def _check_sandbox_server() -> Check:
+    from bloy_dev_agent.features import sandbox_runner
+
+    config = sandbox_runner.SANDBOX_CONFIG
+    if not config.exists():
+        return Check(
+            key="sandbox",
+            label="Sandbox server",
+            state=FAIL,
+            detail=f"Không có {config}",
+            why="OpenSandbox đọc file này để biết host, port và api_key.",
+        )
+
+    import tomllib
+
+    import httpx
+
+    try:
+        server = (tomllib.loads(config.read_text(encoding="utf-8")).get("server") or {})
+        host = str(server.get("host") or "127.0.0.1")
+        port = str(server.get("port") or "8080")
+        if not str(server.get("api_key") or "").strip():
+            return Check(
+                key="sandbox",
+                label="Sandbox server",
+                state=FAIL,
+                detail="server.api_key đang rỗng.",
+                why="Chạy non-interactive mà thiếu key thì server tự thoát.",
+            )
+        httpx.get(f"http://{host}:{port}/", timeout=3.0)
+    except Exception as exc:  # noqa: BLE001 — any failure means "not usable"
+        return Check(
+            key="sandbox",
+            label="Sandbox server",
+            state=FAIL,
+            detail=f"Không kết nối được: {type(exc).__name__}",
+            why="pm2 start opensandbox-server",
+        )
+    return Check(
+        key="sandbox",
+        label="Sandbox server",
+        state=OK,
+        detail=f"http://{host}:{port} trả lời",
+    )
+
+
+def _check_worktree_root() -> Check:
+    from bloy_dev_agent.features import workspace
+
+    root = workspace.DEFAULT_WORKTREE_ROOT
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        probe = root / ".bloy-write-probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+    except OSError as exc:
+        return Check(
+            key="worktree_root",
+            label="Worktree root",
+            state=FAIL,
+            detail=f"{root} không ghi được: {exc}",
+        )
+    return Check(
+        key="worktree_root",
+        label="Worktree root",
+        state=OK,
+        detail=f"{root} ghi được",
+        why="Đây là đường dẫn duy nhất sandbox được ghi vào.",
+    )
+
+
+def _check_repos() -> Check:
+    from bloy_dev_agent.features import pipeline, workspace
+
+    monorepo = pipeline.DEFAULT_MONOREPO
+    present = [name for name in workspace.KNOWN_REPOS if (monorepo / name / ".git").exists()]
+    missing = [name for name in workspace.KNOWN_REPOS if name not in present]
+    return Check(
+        key="repos",
+        label="Repo đích",
+        state=OK if present else FAIL,
+        detail=(
+            f"{len(present)}/{len(workspace.KNOWN_REPOS)} repo có sẵn"
+            + (f" — thiếu: {', '.join(missing)}" if missing else "")
+        ),
+        why=f"Worktree được tách từ các sub-project dưới {monorepo}.",
+    )
+
+
+def _check_twenty() -> Check:
     base_url = os.environ.get("BLOY_TWENTY_BASE_URL", "").strip()
     api_key = os.environ.get("BLOY_TWENTY_API_KEY", "").strip()
-    if base_url and api_key:
-        # Configured is not the same as reachable: prove the key works rather
-        # than reporting green on the presence of two environment variables.
-        from bloy_dev_agent.features.twenty.client import TwentyClient, TwentyError
 
-        try:
-            TwentyClient(base_url=base_url, api_key=api_key).ping()
-        except TwentyError as exc:
-            return Check(
-                key="twenty",
-                label="Twenty connection",
-                state=FAIL,
-                detail=f"{base_url} — {exc.message}",
-                why="Check the API key, its role, and the firewall allowlist.",
-            )
-        return Check(
-            key="twenty",
-            label="Twenty connection",
-            state=OK,
-            detail=f"Authenticated against {base_url}",
-        )
     missing = [
         name
         for name, value in (
@@ -212,40 +228,141 @@ def _check_twenty_config() -> Check:
         )
         if not value
     ]
+    if missing:
+        return Check(
+            key="twenty",
+            label="Twenty",
+            state=FAIL,
+            detail=f"Chưa đặt: {', '.join(missing)}",
+            why="Không có hai biến này thì service không lấy được task.",
+        )
+
+    # Configured is not the same as reachable: prove the key works rather than
+    # reporting green on the presence of two environment variables.
+    from bloy_dev_agent.features.twenty.client import TwentyClient, TwentyError
+
+    try:
+        TwentyClient(base_url=base_url, api_key=api_key).ping()
+    except TwentyError as exc:
+        return Check(
+            key="twenty",
+            label="Twenty",
+            state=FAIL,
+            detail=f"{base_url} — {exc.message}",
+            why="Kiểm tra API key, quyền của nó, và firewall.",
+        )
     return Check(
-        key="twenty",
-        label="Twenty connection",
-        state=WARN,
-        detail=f"Not configured — missing {', '.join(missing)}.",
-        why="Expected until the Twenty admin issues an API key.",
+        key="twenty", label="Twenty", state=OK, detail=f"Đã xác thực với {base_url}"
     )
 
 
-def _check_sys_path() -> Check:
-    hits = [p for p in sys.path if p.rstrip("/").endswith("community_plugins")]
+def _check_bam() -> Check:
+    """BAM is an integration, not a dependency — a run works without it."""
+    import httpx
+
+    url = os.environ.get("BAM_URL", "http://localhost:8000").rstrip("/")
+    try:
+        httpx.get(url, timeout=3.0)
+    except Exception:  # noqa: BLE001
+        return Check(
+            key="bam",
+            label="BAM console",
+            state=WARN,
+            detail=f"{url} không trả lời",
+            why=(
+                "Chỉ ảnh hưởng việc BAM tự kích routine. Service vẫn chạy được "
+                "độc lập, và đó là lý do tách ra."
+            ),
+        )
+    return Check(key="bam", label="BAM console", state=OK, detail=f"{url} trả lời")
+
+
+def _check_git_push() -> Check:
+    """MR được mở bằng git push options, nên SSH phải xác thực được."""
+    import subprocess
+
+    from bloy_dev_agent.features import pipeline, workspace
+
+    repo = pipeline.DEFAULT_MONOREPO / workspace.KNOWN_REPOS[0]
+    if not (repo / ".git").exists():
+        return Check(
+            key="git_push",
+            label="GitLab SSH",
+            state=WARN,
+            detail="Không có repo để thử.",
+        )
+    try:
+        result = subprocess.run(
+            ["git", "ls-remote", "--heads", "origin", "HEAD"],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return Check(
+            key="git_push",
+            label="GitLab SSH",
+            state=FAIL,
+            detail=f"{type(exc).__name__}: {exc}",
+        )
+    if result.returncode != 0:
+        return Check(
+            key="git_push",
+            label="GitLab SSH",
+            state=FAIL,
+            detail=(result.stderr or "").strip()[:200],
+            why="Không push được thì không mở được merge request.",
+        )
     return Check(
-        key="sys_path",
-        label="community_plugins on sys.path",
-        state=OK if hits else WARN,
-        detail=(
-            hits[0] if hits else "Not present — cross-plugin imports will fail."
-        ),
-        why="Inserted by the plugin loader when it loads the first plugin.",
+        key="git_push",
+        label="GitLab SSH",
+        state=OK,
+        detail="origin trả lời — push và mở MR được",
     )
+
+
+# ---------------------------------------------------------------------------
+# Runner
+# ---------------------------------------------------------------------------
+
+_CHECKS = (
+    _check_database,
+    _check_claude,
+    _check_claude_login,
+    _check_sandbox_server,
+    _check_worktree_root,
+    _check_repos,
+    _check_twenty,
+    _check_git_push,
+    _check_bam,
+)
 
 
 def run_checks() -> list[Check]:
-    """Run every check. Never raises — a broken check reports itself."""
-    checks: list[Check] = [_check_link_table()]
-    checks.extend(_check_agent_team())
-    checks.append(_check_routine_plugin())
-    checks.append(_check_twenty_config())
-    checks.append(_check_sys_path())
+    """Run every check, converting a crash into a reportable failure.
+
+    A preflight page that raises is worse than useless — it hides the very
+    problem it exists to surface.
+    """
+    checks: list[Check] = []
+    for probe in _CHECKS:
+        try:
+            checks.append(probe())
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("bloy_dev_agent: preflight %s crashed", probe.__name__)
+            checks.append(
+                Check(
+                    key=probe.__name__.removeprefix("_check_"),
+                    label=probe.__name__.removeprefix("_check_").replace("_", " ").title(),
+                    state=FAIL,
+                    detail=f"Check tự lỗi: {type(exc).__name__}: {exc}",
+                )
+            )
     return checks
 
 
 def summarise(checks: list[Check]) -> dict[str, int]:
-    """Count checks by state for the page header."""
     counts = {OK: 0, WARN: 0, FAIL: 0}
     for check in checks:
         counts[check.state] = counts.get(check.state, 0) + 1
