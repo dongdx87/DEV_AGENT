@@ -1,0 +1,13 @@
+# Extra dependencies for the standalone BLOY Dev Agent service.
+# Installed alongside every other plugin's requirements.txt by
+# `uv run setup-dependencies` (see agent-manager's core/setup.py).
+#
+# fastapi, uvicorn, sqlalchemy, httpx, python-dotenv already come from
+# agent-manager's own pyproject.toml — the service runs inside that same
+# venv (see ecosystem.config.js: `uv run python -m bloy_dev_agent.service`).
+#
+# opensandbox is what features/sandbox_runner.py uses to run the coding
+# agent in an isolated container. Pinned to the same version agent-manager's
+# own sandbox_integration plugin uses, so both stay compatible.
+opensandbox==0.1.9
+opensandbox-code-interpreter==0.1.2
