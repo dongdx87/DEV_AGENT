@@ -12,6 +12,7 @@ So a run always names the sub-project it targets.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import subprocess
 from dataclasses import dataclass
@@ -19,9 +20,16 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-#: Where per-issue worktrees live. Kept outside the repos so a stray glob or a
-#: clean-up in the main checkout cannot touch them.
-DEFAULT_WORKTREE_ROOT = Path("/home/bss-group/bloy-worktrees")
+
+def default_worktree_root() -> Path:
+    """Where per-issue worktrees live, overridable per host via ``BLOY_WORKTREE_ROOT``.
+
+    Kept outside the repos so a stray glob or a clean-up in the main checkout
+    cannot touch them. Read at call time, not baked in as a module constant —
+    this module is imported before ``service.load_env()`` fills ``os.environ``
+    from ``BLOY_DEV_AGENT/.env``, so a plain constant would miss that file.
+    """
+    return Path(os.environ.get("BLOY_WORKTREE_ROOT", "/home/bss-group/bloy-worktrees"))
 
 #: Sub-projects the agent may work in, relative to the monorepo directory.
 KNOWN_REPOS = (
@@ -107,7 +115,7 @@ def prepare(
     *,
     monorepo: Path,
     repo: str,
-    root: Path = DEFAULT_WORKTREE_ROOT,
+    root: Path | None = None,
     base_branch: str = "",
 ) -> Workspace:
     """Create (or reuse) a worktree for ``issue_key`` in ``repo``.
@@ -115,6 +123,7 @@ def prepare(
     Reuse matters: a second pass on the same issue should continue on the same
     branch rather than lose the first attempt.
     """
+    root = root if root is not None else default_worktree_root()
     if repo not in KNOWN_REPOS:
         raise WorkspaceError(f"Unknown repo {repo!r}; expected one of {KNOWN_REPOS}")
 

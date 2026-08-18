@@ -17,3 +17,8 @@ db/
 # Agent reasoning logs, written next to the worktrees rather than here, but
 # ignored in case a run is ever pointed at the repo.
 .bloy-logs/
+
+# Local BLOY_MONOREPO / BLOY_WORKTREE_ROOT targets for dev hosts that aren't
+# /home/bss-group — real source checkouts and per-issue worktrees, never source.
+dev-monorepo/
+dev-worktrees/

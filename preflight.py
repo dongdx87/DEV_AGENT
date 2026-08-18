@@ -176,7 +176,7 @@ def _check_sandbox_server() -> Check:
 def _check_worktree_root() -> Check:
     from bloy_dev_agent.features import workspace
 
-    root = workspace.DEFAULT_WORKTREE_ROOT
+    root = workspace.default_worktree_root()
     try:
         root.mkdir(parents=True, exist_ok=True)
         probe = root / ".bloy-write-probe"
@@ -201,7 +201,7 @@ def _check_worktree_root() -> Check:
 def _check_repos() -> Check:
     from bloy_dev_agent.features import pipeline, workspace
 
-    monorepo = pipeline.DEFAULT_MONOREPO
+    monorepo = pipeline.default_monorepo()
     present = [name for name in workspace.KNOWN_REPOS if (monorepo / name / ".git").exists()]
     missing = [name for name in workspace.KNOWN_REPOS if name not in present]
     return Check(
@@ -283,7 +283,7 @@ def _check_git_push() -> Check:
 
     from bloy_dev_agent.features import pipeline, workspace
 
-    repo = pipeline.DEFAULT_MONOREPO / workspace.KNOWN_REPOS[0]
+    repo = pipeline.default_monorepo() / workspace.KNOWN_REPOS[0]
     if not (repo / ".git").exists():
         return Check(
             key="git_push",
