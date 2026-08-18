@@ -67,7 +67,13 @@
             <option value="{{ repo }}" {% if settings.get("target_repo") == repo %}selected{% endif %}>{{ repo }}</option>
           {% endfor %}
         </select>
-        <p class="mt-1 text-xs text-slate-500">Sub-project mà worktree được tách ra từ đó.</p>
+        <p class="mt-1 text-xs text-slate-500">
+          Chỉ dùng khi ticket KHÔNG tự khai repo. Ticket ghi
+          <code class="rounded bg-slate-100 px-1">Repos: shopify-app-loyalty-api, shopify-app-loyalty-cms</code>
+          ở mô tả thì danh sách đó thắng, và đó cũng là cách duy nhất để một task
+          sửa nhiều repo. Đặt sai ô này từng khiến một task chạy nhầm repo và tốn
+          một lượt thử.
+        </p>
       </div>
       {{ field("timeout_minutes", "Timeout sandbox (phút)",
                settings.get("timeout_minutes", ""),

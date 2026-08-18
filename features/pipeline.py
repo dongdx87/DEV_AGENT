@@ -21,6 +21,7 @@ container. That single line is the whole security boundary.
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -71,6 +72,12 @@ class PipelineOutcome:
     aborted: bool = False
     #: True when the deliverable was an answer to hand over, not a merge request.
     advice: bool = False
+    #: Lockfiles the run touched and that were reverted before committing.
+    discarded: tuple[str, ...] = ()
+    #: One entry per sub-project that produced a merge request. A customer
+    #: change often spans the API rule and the CMS screen, and half a fix is
+    #: worse than none — the reviewer needs both links side by side.
+    merge_requests: tuple[tuple[str, str], ...] = ()
     attempt: int = 0
 
 
@@ -178,10 +185,26 @@ def _report(outcome: PipelineOutcome, issue_key: str, answer: str = "") -> str:
             "",
             f"Branch: {outcome.branch}",
         ]
-        if outcome.merge_request_url:
+        if outcome.merge_requests:
+            lines.append("Merge request:")
+            lines += [f"  {repo}: {url}" for repo, url in outcome.merge_requests]
+        elif outcome.merge_request_url:
             lines.append(f"Merge request: {outcome.merge_request_url}")
         if outcome.changed:
             lines += ["", "Thay đổi:", outcome.changed]
+        if outcome.discarded:
+            lines += [
+                "",
+                "Đã bỏ khỏi commit (lockfile không được vào MR): "
+                + ", ".join(outcome.discarded),
+            ]
+        if answer:
+            # The agent's own report — the business rule it derived and the
+            # assumptions it could not verify. Without this the reviewer sees a
+            # diffstat and a link, and has no idea where the risk is. One ticket
+            # shipped an unworkable fix built on a confidently wrong premise that
+            # was stated in exactly this report and never reached anyone.
+            lines += ["", "--- Báo cáo của agent ---", answer.strip()]
         lines += ["", f"Sandbox: {outcome.sandbox_id}", "", "Cần người review trước khi merge."]
         return "\n".join(lines)
 
@@ -277,11 +300,20 @@ def run_issue(
         return outcome
 
     # --- worktree ---------------------------------------------------------
+    # A ticket may name several sub-projects; the first one is where the agent
+    # starts and the rest are prepared beside it. They all live under the same
+    # mounted root, so the container sees every one of them without extra
+    # plumbing — only the prompt has to say they exist.
     store.set_stage(run_id, "worktree")
+    repos = mapping.wanted_repos(issue, workspace.KNOWN_REPOS) or [target_repo]
     try:
-        space = workspace.prepare(
-            issue.key, monorepo=monorepo, repo=target_repo, root=worktree_root
-        )
+        spaces = [
+            workspace.prepare(
+                issue.key, monorepo=monorepo, repo=name, root=worktree_root
+            )
+            for name in repos
+        ]
+        space = spaces[0]
     except workspace.WorkspaceError as exc:
         outcome = PipelineOutcome(
             issue.key, False, stage="worktree", detail=str(exc),
@@ -295,12 +327,16 @@ def run_issue(
     # there, and it gives up in seconds without touching a file.
     store.set_stage(run_id, "sandbox", branch=space.branch)
     advice = mapping.wants_advice(issue)
+    workdirs = [
+        sandbox_runner.container_path(s.path, worktree_root) for s in spaces
+    ]
     prompt = mapping.build_prompt(
         issue,
-        sandbox_runner.container_path(space.path, worktree_root),
+        workdirs[0],
         implement=not advice,
         monorepo=sandbox_runner.MONOREPO_MOUNT,
         advice=advice,
+        extra_workdirs=workdirs[1:],
     )
     result = sandbox_runner.run_in_sandbox(
         prompt,
@@ -346,7 +382,16 @@ def run_issue(
             answer=result.output,
         )
 
-    if not workspace.has_changes(space):
+    # Drop lockfile churn before judging whether the run changed anything, so a
+    # run whose ONLY output was a lockfile is correctly reported as no-change.
+    discarded: list[str] = []
+    for candidate in spaces:
+        discarded += [f"{candidate.repo}/{name}"
+                      for name in workspace.discard_lockfile_changes(candidate)]
+
+    touched = [candidate for candidate in spaces if workspace.has_changes(candidate)]
+
+    if not touched:
         outcome = PipelineOutcome(
             issue.key,
             False,
@@ -354,7 +399,14 @@ def run_issue(
             branch=space.branch,
             sandbox_id=result.sandbox_id,
             detail=(
-                "Agent chạy xong nhưng không sửa file nào. Nội dung agent trả về:\n\n"
+                (
+                    "Agent chỉ thay đổi lockfile ("
+                    + ", ".join(discarded)
+                    + "), đã bỏ — lockfile không được vào MR.\n\n"
+                    if discarded
+                    else "Agent chạy xong nhưng không sửa file nào.\n\n"
+                )
+                + "Nội dung agent trả về:\n\n"
                 + result.output[:1500]
             ),
             run_id=run_id,
@@ -362,25 +414,38 @@ def run_issue(
         )
         return _finish(client, issue, outcome, statuses, error_status)
 
-    changed = workspace.diffstat(space)
+    changed = "\n".join(
+        f"[{candidate.repo}]\n{workspace.diffstat(candidate)}" for candidate in touched
+    )
 
     # --- host: commit, push, merge request --------------------------------
     store.set_stage(run_id, "commit", changed=changed)
-    try:
-        push = workspace.commit_and_push(
-            space,
-            title=f"{issue.key}: {issue.title}"[:120],
-            body=f"Dev Agent tự động thực hiện {issue.key}.\n\nSandbox: {result.sandbox_id}",
-            create_mr=create_mr,
-        )
-    except workspace.WorkspaceError as exc:
-        outcome = PipelineOutcome(
-            issue.key, False, stage="commit", branch=space.branch, detail=str(exc),
-            changed=changed, run_id=run_id, attempt=attempt_no,
-        )
-        return _finish(client, issue, outcome, statuses, error_status)
+    merge_requests: list[tuple[str, str]] = []
+    failures: list[str] = []
+    for candidate in touched:
+        try:
+            push = workspace.commit_and_push(
+                candidate,
+                title=f"{issue.key}: {issue.title}"[:120],
+                body=(
+                    f"Dev Agent tự động thực hiện {issue.key}.\n\n"
+                    f"Sandbox: {result.sandbox_id}"
+                ),
+                create_mr=create_mr,
+            )
+        except workspace.WorkspaceError as exc:
+            failures.append(f"{candidate.repo}: {exc}")
+            continue
+        if push.get("ok"):
+            merge_requests.append(
+                (candidate.repo, str(push.get("merge_request_url") or ""))
+            )
+        else:
+            failures.append(f"{candidate.repo}: {push.get('detail') or 'push thất bại'}")
 
-    if not push.get("ok"):
+    # Partial success is still a failure to report: a reviewer who sees one MR
+    # and no warning would merge half a change spanning two repositories.
+    if failures:
         outcome = PipelineOutcome(
             issue.key,
             False,
@@ -388,9 +453,11 @@ def run_issue(
             branch=space.branch,
             changed=changed,
             sandbox_id=result.sandbox_id,
-            detail=str(push.get("detail") or "push thất bại"),
+            detail="; ".join(failures),
             run_id=run_id,
             attempt=attempt_no,
+            merge_requests=tuple(merge_requests),
+            discarded=tuple(discarded),
         )
         return _finish(client, issue, outcome, statuses, error_status)
 
@@ -399,13 +466,15 @@ def run_issue(
         True,
         stage="done",
         branch=space.branch,
-        merge_request_url=str(push.get("merge_request_url") or ""),
+        merge_request_url=merge_requests[0][1] if merge_requests else "",
         sandbox_id=result.sandbox_id,
         changed=changed,
         run_id=run_id,
         attempt=attempt_no,
+        discarded=tuple(discarded),
+        merge_requests=tuple(merge_requests),
     )
-    return _finish(client, issue, outcome, statuses, done_status)
+    return _finish(client, issue, outcome, statuses, done_status, answer=result.output)
 
 
 def _finish(client, issue, outcome: PipelineOutcome, statuses, status_name: str,
@@ -437,6 +506,11 @@ def _finish(client, issue, outcome: PipelineOutcome, statuses, status_name: str,
             detail=outcome.detail,
             branch=outcome.branch or None,
             merge_request_url=outcome.merge_request_url or None,
+            merge_requests_json=(
+                json.dumps([list(pair) for pair in outcome.merge_requests])
+                if outcome.merge_requests
+                else None
+            ),
             sandbox_id=outcome.sandbox_id or None,
             changed=outcome.changed or None,
         )

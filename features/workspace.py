@@ -64,6 +64,44 @@ def branch_name(issue_key: str) -> str:
     return f"bloy/{_SAFE.sub('-', issue_key).strip('-').lower()}"
 
 
+def default_base(source: Path) -> str:
+    """The repository's integration branch, from ``origin/HEAD``.
+
+    Deliberately NOT the branch that happens to be checked out. A developer
+    leaves their own feature branch open for days, and an unattended agent that
+    inherited it produced a merge request carrying two of their unpushed commits
+    and targeting their branch instead of master — the reviewer saw 19 changed
+    files where the agent had touched 3.
+
+    Falls back to the checked-out branch only when the remote has no HEAD, which
+    happens on a bare local repository with no upstream.
+    """
+    ref = _git(["symbolic-ref", "refs/remotes/origin/HEAD"], source)
+    if ref.returncode == 0:
+        name = ref.stdout.strip().removeprefix("refs/remotes/origin/")
+        if name:
+            return name
+
+    # Ask the remote directly before giving up; a fresh clone may not have the
+    # symbolic ref yet even though the remote knows its default branch.
+    remote = _git(["remote", "show", "origin"], source)
+    if remote.returncode == 0:
+        for line in remote.stdout.splitlines():
+            if "HEAD branch:" in line:
+                name = line.split("HEAD branch:", 1)[1].strip()
+                if name and name != "(unknown)":
+                    return name
+
+    fallback = _require(
+        _git(["rev-parse", "--abbrev-ref", "HEAD"], source), "read the current branch"
+    )
+    logger.warning(
+        "bloy_dev_agent: %s có origin/HEAD không xác định, dùng nhánh đang mở (%s)",
+        source.name, fallback,
+    )
+    return fallback
+
+
 def prepare(
     issue_key: str,
     *,
@@ -88,9 +126,24 @@ def prepare(
     branch = branch_name(issue_key)
     target = root / f"{_SAFE.sub('-', issue_key).lower()}-{repo}"
 
-    base = base_branch or _require(
-        _git(["rev-parse", "--abbrev-ref", "HEAD"], source), "read the current branch"
-    )
+    base = base_branch or default_base(source)
+
+    # Branch from what the remote has, not from whatever this checkout last
+    # pulled. A machine running the agent unattended goes stale within a day,
+    # and a merge request built on stale master is noise for the reviewer:
+    # it carries conflicts, or "fixes" something already fixed upstream.
+    # Observed here with master two commits behind while a run was starting.
+    start_point = base
+    if _git(["fetch", "--quiet", "origin", base], source).returncode == 0:
+        remote_ref = f"origin/{base}"
+        if _git(["rev-parse", "--verify", "--quiet", remote_ref], source).returncode == 0:
+            start_point = remote_ref
+    else:
+        # Offline or the remote is down. Working from a stale base still beats
+        # refusing the ticket, but the reviewer should know which it was.
+        logger.warning(
+            "bloy_dev_agent: không fetch được origin/%s, tách nhánh từ bản local", base
+        )
 
     if target.exists():
         # Already prepared. Verify it is really a worktree of this repo before
@@ -106,11 +159,100 @@ def prepare(
     if exists:
         args += [str(target), branch]
     else:
-        args += ["-b", branch, str(target), base]
+        args += ["-b", branch, str(target), start_point]
     _require(_git(args, source), f"create a worktree for {issue_key}")
 
-    logger.info("bloy_dev_agent: worktree %s on %s", target, branch)
+    logger.info(
+        "bloy_dev_agent: worktree %s on %s (tách từ %s)", target, branch, start_point
+    )
     return Workspace(issue_key, repo, target, branch, base)
+
+
+#: Files a run must never bring into a merge request. The agent installs
+#: dependencies while exploring — reading a package's source, running a test —
+#: and the lockfile churn that follows swamps the real change: BLS-1080 shipped
+#: one meaningful line beside 179 lines of ``package-lock.json``. A dependency
+#: bump is a deliberate act with its own review, never a side effect.
+LOCKFILES = frozenset(
+    {
+        "package-lock.json",
+        "npm-shrinkwrap.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        "composer.lock",
+        "Gemfile.lock",
+        "poetry.lock",
+        "uv.lock",
+        "Pipfile.lock",
+        "cargo.lock",
+        "Cargo.lock",
+    }
+)
+
+
+def discard_lockfile_changes(workspace: Workspace) -> list[str]:
+    """Undo any lockfile the run touched; return the paths reverted.
+
+    Enforced here rather than only asked for in the prompt: an instruction is a
+    request, and this is the single place where anything gets staged, so it is
+    the one place the rule can actually hold.
+    """
+    status = _git(["status", "--porcelain", "--untracked-files=all"], workspace.path)
+    reverted: list[str] = []
+
+    for line in status.stdout.splitlines():
+        if len(line) < 4:
+            continue
+        code, path = line[:2], line[3:].strip().strip('"')
+        # Renames read "old -> new"; the destination is what is staged.
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1]
+        if Path(path).name not in LOCKFILES:
+            continue
+
+        if code.strip() == "??":
+            (workspace.path / path).unlink(missing_ok=True)
+        else:
+            _git(["checkout", "--", path], workspace.path)
+        reverted.append(path)
+
+    if reverted:
+        logger.info(
+            "bloy_dev_agent: bỏ thay đổi lockfile khỏi %s: %s",
+            workspace.issue_key,
+            ", ".join(reverted),
+        )
+    return reverted
+
+
+def reset_to_base(workspace: Workspace) -> bool:
+    """Throw away everything on the branch and start again from its base.
+
+    A retry has to begin from a clean base. Without this, a second attempt
+    stacks a commit on top of the first — so a run that was retried precisely
+    *because* its commit was wrong keeps that commit in the merge request, and
+    the push is a non-fast-forward besides.
+
+    Returns True when something was actually discarded.
+    """
+    ahead = _git(["rev-list", "--count", f"{workspace.base_branch}..HEAD"], workspace.path)
+    had_commits = (ahead.stdout or "0").strip() not in ("", "0")
+    dirty = bool(_git(["status", "--porcelain"], workspace.path).stdout.strip())
+    if not had_commits and not dirty:
+        return False
+
+    _require(
+        _git(["reset", "--hard", workspace.base_branch], workspace.path),
+        f"reset {workspace.branch} to {workspace.base_branch}",
+    )
+    # Untracked leftovers would otherwise be committed by the next `add -A`.
+    _git(["clean", "-fd"], workspace.path)
+    logger.info(
+        "bloy_dev_agent: %s reset về %s (bỏ commit/thay đổi của lượt trước)",
+        workspace.branch,
+        workspace.base_branch,
+    )
+    return True
 
 
 def has_changes(workspace: Workspace) -> bool:

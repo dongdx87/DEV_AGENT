@@ -232,9 +232,18 @@
               <td class="px-5 py-2.5 text-right text-slate-600">{{ run.attempt }}</td>
               <td class="px-5 py-2.5 text-right font-mono text-xs text-slate-600">{{ run.elapsed }}</td>
               <td class="px-5 py-2.5">
-                {% if run.merge_request_url %}
-                  <a href="{{ run.merge_request_url }}" target="_blank" rel="noopener"
-                     class="text-indigo-600 hover:text-indigo-500">Merge request →</a>
+                {% if run.merge_requests %}
+                  {# One ticket can span several sub-projects. A single link would
+                     send the reviewer to whichever repo happened to be first, and
+                     nothing would hint the other half of the change existed. #}
+                  <div class="space-y-0.5">
+                    {% for repo, url in run.merge_requests %}
+                      <a href="{{ url }}" target="_blank" rel="noopener"
+                         class="block text-indigo-600 hover:text-indigo-500">
+                        {{ repo | replace("shopify-app-loyalty-", "") if repo else "Merge request" }} →
+                      </a>
+                    {% endfor %}
+                  </div>
                 {% elif run.detail %}
                   <span class="line-clamp-1 max-w-sm text-xs text-slate-500">{{ run.detail }}</span>
                 {% else %}

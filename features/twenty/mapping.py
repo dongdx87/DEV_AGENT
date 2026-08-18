@@ -141,6 +141,22 @@ Do not modify any file."""
 #: while the customer only wants their own theme adjusted.
 ADVICE_MARKER = "deliverable: snippet"
 
+#: Marker a ticket carries when the fix spans more than one sub-project, e.g.
+#: ``Repos: shopify-app-loyalty-api, shopify-app-loyalty-cms``. A customer-facing
+#: change often needs both — the rule in the API and the screen in the CMS — and
+#: a run confined to one repo can only do half of it, or worse, guess.
+REPOS_MARKER = re.compile(r"^\s*repos?\s*:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
+
+
+def wanted_repos(issue: NormalizedIssue, known: tuple[str, ...]) -> list[str]:
+    """Sub-projects the ticket names, in the order given; empty when it names none."""
+    match = REPOS_MARKER.search(issue.body or "")
+    if not match:
+        return []
+    named = [part.strip() for part in re.split(r"[,;]", match.group(1))]
+    return [repo for repo in named if repo in known]
+
+
 def wants_advice(issue: NormalizedIssue) -> bool:
     """True when the ticket asks for a snippet rather than a repository change."""
     return ADVICE_MARKER in (issue.body or "").lower()
@@ -168,7 +184,47 @@ Implement the ticket, in this order:
 3. Run the relevant tests and report their actual output.
 4. List what you changed and what you deliberately left out.
 
-Work only inside this repository. Do not push, deploy, or touch production."""
+Work only inside this repository. Do not push, deploy, or touch production.
+
+Never modify a dependency lockfile (package-lock.json, yarn.lock, pnpm-lock.yaml
+and the like), and avoid commands that rewrite one — prefer `npm ci` over
+`npm install`, or read the dependency's source instead of installing it. A
+lockfile diff buries the change a reviewer came to read: one ticket shipped a
+single meaningful line beside 179 lines of lockfile churn. Any lockfile change
+is reverted before committing, so touching one only wastes the run."""
+
+#: Product documentation, mounted with the monorepo. 77 files grouped by feature
+#: (earning, redeeming, vip-tiers, referrals, promotions, storefront,
+#: use-cases-and-faqs, reference). The agent could always reach it and never did,
+#: because nothing pointed at it.
+DOCS_DIR = "docs-fts-bloy-loyalty/docs"
+
+#: The reasoning the report must show. Added after a ticket where the code fix
+#: was mechanically plausible and still wrong: a POS "Custom amount" gift card
+#: arrives with product_id AND variant_id null, so matching ids can never reach
+#: it — while the business rule (buying a gift card moves money between tenders,
+#: so it is not a purchase and never earns points) gives a fix that always works.
+#: The agent had asserted "the line item still carries the product_id" as fact.
+BUSINESS_INSTRUCTIONS = """\
+Before writing code, work out the BUSINESS rule, not just the code path:
+
+A. What is the product supposed to do here, and why? Read
+   {docs}/ — product documentation grouped by feature (earning, redeeming,
+   vip-tiers, referrals, promotions, storefront, use-cases-and-faqs). Say which
+   file you relied on, or say plainly that the docs do not cover it.
+B. State the rule in one sentence a support agent would recognise.
+C. Prefer a fix at the level of that rule over one that depends on how a
+   merchant happened to configure their settings. A fix that only works when
+   the merchant already ticked the right box has not fixed the bug.
+
+Then, in the report, under the exact heading "GIẢ ĐỊNH CHƯA XÁC MINH", list
+every claim your change depends on that you could NOT verify by reading this
+repository — payload shapes from Shopify, values only present in production
+data, third-party behaviour. Write "không có" if there are none.
+
+State these as open questions, not as facts. A confident wrong premise is how
+one ticket shipped a fix that could never work, and its tests passed because
+they were written against the same wrong premise."""
 
 
 _PROMPT_TEMPLATE = textwrap.dedent("""\
@@ -181,6 +237,8 @@ _PROMPT_TEMPLATE = textwrap.dedent("""\
     {body}
 
     {orientation}
+
+    {business}
 
     {task}
 
@@ -195,6 +253,7 @@ def build_prompt(
     implement: bool = False,
     monorepo: str = "",
     advice: bool = False,
+    extra_workdirs: list[str] | None = None,
 ) -> str:
     """Compose the instruction sent to the coding agent.
 
@@ -219,6 +278,22 @@ def build_prompt(
 
             Find the real selectors in whichever sub-project owns the surface the
             ticket describes — it is often not the same one as {repo}.""")
+    elif monorepo and extra_workdirs:
+        every = "\n".join(f"  - {path}" for path in [repo, *extra_workdirs])
+        orientation = textwrap.dedent(f"""\
+            This ticket spans several sub-projects. You may WRITE in any of these
+            worktrees, and only these:
+            {{every}}
+
+            Start in {repo}. Each is a separate git repository and becomes its own
+            merge request, so keep each change self-contained and reviewable on its
+            own — do not leave one half depending on an unmerged change in the other.
+
+            The whole monorepo is readable at {monorepo} (read-only). Read
+            {monorepo}/CLAUDE.md first: it maps which sub-project owns what.
+
+            If a sub-project turns out not to need changing, leave it untouched —
+            an empty merge request is worse than none.""").replace("{every}", every)
     elif monorepo:
         orientation = textwrap.dedent(f"""\
             You may only WRITE inside {repo} — that is this ticket's git worktree.
@@ -237,8 +312,12 @@ def build_prompt(
     # start at column zero, so the common prefix across the whole string is
     # empty and ``dedent`` strips nothing. The model then receives what looks
     # like an indented code block instead of instructions.
+    business = (
+        BUSINESS_INSTRUCTIONS.format(docs=f"{monorepo}/{DOCS_DIR}") if monorepo else ""
+    )
     return _PROMPT_TEMPLATE.format(
         key=issue.key,
+        business=business,
         title=issue.title,
         status=issue.status_name,
         body=body,

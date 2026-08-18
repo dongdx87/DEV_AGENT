@@ -103,7 +103,13 @@ class BloyPipelineRun(Base):
     stage: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
     branch: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    #: The first merge request, kept for older rows and simple callers.
     merge_request_url: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    #: Every merge request the run opened, as JSON ``[[repo, url], ...]``. One
+    #: ticket can span several sub-projects, and a single link would send the
+    #: reviewer to whichever repo happened to be first — they would see half the
+    #: change and no sign the other half existed.
+    merge_requests_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     sandbox_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
     #: Absolute path of the agent's streamed reasoning log, tailed by the UI.

@@ -1,0 +1,133 @@
+{% extends "base.html" %}
+
+{% set state_styles = {
+  "ok":   "bg-emerald-50 text-emerald-700 ring-emerald-600/20",
+  "warn": "bg-amber-50 text-amber-700 ring-amber-600/20",
+  "fail": "bg-rose-50 text-rose-700 ring-rose-600/20"
+} %}
+{% set input_cls = "w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/30 focus:border-indigo-500" %}
+
+{% block content %}
+<div class="max-w-4xl mx-auto space-y-5">
+
+  <div class="bg-white rounded-2xl shadow-sm border border-slate-200 p-6">
+    <h1 class="text-2xl font-semibold tracking-tight text-slate-900">Setup</h1>
+    <p class="mt-1 text-sm text-slate-500 max-w-prose">
+      Dựng agent trên một máy mới. Việc nào service tự làm được thì có nút bấm;
+      việc nào cần quyền root hoặc trình duyệt thì đưa lệnh để bạn dán —
+      <span class="font-medium">sudo trên máy này hỏi mật khẩu</span>, nên một cái
+      form giả vờ cài được Docker chỉ dời lỗi sang chỗ khó hiểu hơn.
+    </p>
+    <div class="mt-4 flex items-center gap-2 text-xs font-medium">
+      {% for key, label in [("ok","xong"),("warn","cảnh báo"),("fail","còn thiếu")] %}
+      <span class="px-2.5 py-1 rounded-lg ring-1 ring-inset {{ state_styles[key] }}">
+        {{ counts.get(key, 0) }} {{ label }}
+      </span>
+      {% endfor %}
+      {% if ready %}
+      <span class="ml-2 text-emerald-700">Sẵn sàng chạy task.</span>
+      {% endif %}
+    </div>
+  </div>
+
+  {% if message %}
+  <div class="rounded-2xl border border-sky-300 bg-sky-50 px-5 py-3 text-sm text-sky-900">
+    {{ message }}
+  </div>
+  {% endif %}
+
+  {# ---------- steps ---------- #}
+  <section class="rounded-2xl border border-slate-200 bg-white shadow-sm divide-y divide-slate-100">
+    {% for step in steps %}
+    <article class="px-5 py-4">
+      <div class="flex items-start justify-between gap-4 flex-wrap">
+        <div class="min-w-0">
+          <div class="flex items-center gap-2">
+            <span class="px-2 py-0.5 rounded-md text-xs font-medium ring-1 ring-inset {{ state_styles.get(step.state, '') }}">
+              {{ step.state }}
+            </span>
+            <h2 class="text-sm font-semibold text-slate-900">{{ step.label }}</h2>
+          </div>
+          <p class="mt-1 text-sm text-slate-600 break-words">{{ step.detail }}</p>
+          {% if step.why %}
+          <p class="mt-1 text-xs text-slate-500 max-w-prose">{{ step.why }}</p>
+          {% endif %}
+          {% if step.command %}
+          <div class="mt-2">
+            <p class="text-xs font-medium text-slate-500">Chạy lệnh này trong terminal:</p>
+            <pre class="mt-1 overflow-x-auto rounded-lg bg-slate-900 px-3 py-2 text-xs text-slate-100">{{ step.command }}</pre>
+          </div>
+          {% endif %}
+        </div>
+
+        {% if step.fix and step.fix != "form" %}
+        <form method="post" action="/setup/fix/{{ step.fix }}">
+          <button type="submit"
+            class="whitespace-nowrap rounded-lg bg-indigo-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/40">
+            {{ step.fix_label or "Sửa" }}
+          </button>
+        </form>
+        {% endif %}
+      </div>
+    </article>
+    {% endfor %}
+  </section>
+
+  <form method="post" action="/setup" class="rounded-2xl border border-slate-200 bg-white shadow-sm p-5 space-y-4">
+    <div>
+      <h2 class="text-base font-semibold text-slate-900">Kết nối Twenty</h2>
+      <p class="text-sm text-slate-500 max-w-prose">
+        Lưu vào database của service. Nếu môi trường đã có
+        <code class="text-xs">BLOY_TWENTY_*</code> thì biến môi trường thắng.
+      </p>
+    </div>
+    <div>
+      <label for="twenty_base_url" class="block text-sm font-medium text-slate-800">Twenty URL</label>
+      <input id="twenty_base_url" name="twenty_base_url" type="text" class="mt-1 {{ input_cls }}"
+             value="{{ twenty_url }}" placeholder="http://localhost:3005">
+    </div>
+    <div>
+      <label for="twenty_api_key" class="block text-sm font-medium text-slate-800">Twenty API key</label>
+      <input id="twenty_api_key" name="twenty_api_key" type="password" class="mt-1 {{ input_cls }}"
+             value="{{ twenty_key }}" placeholder="{{ 'đã lưu — để trống nếu giữ nguyên' if twenty_key else 'dán key' }}">
+      <p class="mt-1 text-xs text-slate-500">
+        Lưu trong SQLite của service, quyền của user chạy service — tương đương một file .env.
+      </p>
+    </div>
+
+    <div>
+      <h2 class="pt-2 text-base font-semibold text-slate-900">Đường dẫn</h2>
+    </div>
+    <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
+      <div>
+        <label for="monorepo" class="block text-sm font-medium text-slate-800">Thư mục monorepo</label>
+        <input id="monorepo" name="monorepo" type="text" class="mt-1 {{ input_cls }}"
+               value="{{ monorepo }}">
+        <p class="mt-1 text-xs text-slate-500">Nơi chứa 3 repo con; mount read-only vào sandbox.</p>
+      </div>
+      <div>
+        <label for="git_remote" class="block text-sm font-medium text-slate-800">Prefix remote git</label>
+        <input id="git_remote" name="git_remote" type="text" class="mt-1 {{ input_cls }}"
+               value="{{ git_remote }}">
+        <p class="mt-1 text-xs text-slate-500">Dùng khi bấm “Clone repo còn thiếu”.</p>
+      </div>
+    </div>
+
+    <div class="flex items-center gap-2">
+      <button type="submit"
+        class="rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/40">
+        Lưu &amp; kiểm tra lại
+      </button>
+      <a href="/setup" class="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50">
+        Kiểm tra lại
+      </a>
+    </div>
+  </form>
+
+  <p class="text-xs text-slate-400 max-w-prose">
+    Trang này ghi file và chạy tiến trình dưới quyền user của service, nên nó chỉ
+    nghe ở <code>127.0.0.1</code> và chỉ chạy được đúng một danh sách hành động
+    cố định — không có ô nào nhận lệnh tự do.
+  </p>
+</div>
+{% endblock %}

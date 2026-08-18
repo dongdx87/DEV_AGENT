@@ -37,6 +37,15 @@ SETTING_ERROR_STATUS = "error_status"
 SETTING_BLOCKED_STATUS = "blocked_status"
 SETTING_TIMEOUT_MINUTES = "timeout_minutes"
 
+#: Twenty credentials. Stored here so a new machine is configured from the
+#: browser rather than by editing someone else's ``.env`` — the environment is
+#: still honoured, and still wins, for deployments that inject secrets that way.
+SETTING_TWENTY_URL = "twenty_base_url"
+SETTING_TWENTY_KEY = "twenty_api_key"
+
+#: Prefix used when the setup page clones a missing sub-project.
+SETTING_GIT_REMOTE = "git_remote"
+
 
 def _now() -> datetime:
     return datetime.now(UTC)

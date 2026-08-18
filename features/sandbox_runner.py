@@ -80,6 +80,15 @@ PROMPT_PATH = "/tmp/bloy-prompt.txt"
 #: Where the CLI's stderr lands when stdout is reserved for the JSON stream.
 STDERR_PATH = "/tmp/bloy-stderr.txt"
 
+#: Stamped on every sandbox this plugin creates so a later sweep can tell ours
+#: apart from anything else sharing the OpenSandbox server. Without a marker the
+#: only safe reaper is no reaper.
+OWNER_TAG = "bloy_dev_agent"
+
+#: Header the server wants for the admin REST surface. The SDK has no list/kill
+#: by id, so the orphan sweep talks to that surface directly.
+API_KEY_HEADER = "OPEN-SANDBOX-API-KEY"
+
 #: Shell fragment setting ``$u`` to whoever owns the agent uid in the image.
 RESOLVE_AGENT_USER = f"u=$(getent passwd {AGENT_UID} | cut -d: -f1)"
 
@@ -250,6 +259,7 @@ async def _run_async(
         timeout=timedelta(minutes=timeout_minutes),
         connection_config=_connection(),
         volumes=_volumes(worktree_root, monorepo),
+        metadata={"owner": OWNER_TAG, "run_id": run_id or "adhoc"},
     )
     sandbox_id = getattr(sandbox, "sandbox_id", "") or getattr(sandbox, "id", "")
     logger.info("bloy_dev_agent: sandbox %s working in %s", sandbox_id, workdir)
@@ -362,3 +372,96 @@ def run_in_sandbox(
     except Exception as exc:  # noqa: BLE001 — report, never crash the routine
         logger.exception("bloy_dev_agent: sandbox run failed")
         return SandboxResult(False, f"Sandbox run failed: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Orphan sweep
+# ---------------------------------------------------------------------------
+#
+# A sandbox outlives the process that made it. Kill the service mid-run and the
+# container keeps burning CPU and a worktree lock until its own timeout expires
+# — during development that meant reaching for `docker rm` by hand, repeatedly.
+#
+# The SDK exposes no list-by-id, so this talks to the server's REST surface.
+# Borrowed in shape from agent_team's sandbox GC, which solved the same problem
+# first; this version is smaller because a run here owns its sandbox for one
+# pass rather than for a whole task's lifetime.
+
+
+def _server_base() -> tuple[str, str]:
+    """``(base_url, api_key)`` for the admin REST surface."""
+    config = tomllib.loads(SANDBOX_CONFIG.read_text(encoding="utf-8"))
+    server = config.get("server") or {}
+    host = str(server.get("host") or "127.0.0.1")
+    port = str(server.get("port") or "8080")
+    return f"http://{host}:{port}", str(server.get("api_key") or "").strip()
+
+
+def list_sandboxes() -> list[dict]:
+    """Every sandbox the server currently holds, ours or not."""
+    import httpx
+
+    base, key = _server_base()
+    try:
+        response = httpx.get(
+            f"{base}/v1/sandboxes",
+            headers={API_KEY_HEADER: key},
+            params={"pageSize": 100},
+            timeout=10.0,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except Exception:  # noqa: BLE001 — a sweep must never break the caller
+        logger.exception("bloy_dev_agent: could not list sandboxes")
+        return []
+    items = payload.get("items") if isinstance(payload, dict) else payload
+    return [item for item in (items or []) if isinstance(item, dict)]
+
+
+def kill_sandbox(sandbox_id: str) -> bool:
+    import httpx
+
+    base, key = _server_base()
+    try:
+        response = httpx.delete(
+            f"{base}/v1/sandboxes/{sandbox_id}",
+            headers={API_KEY_HEADER: key},
+            timeout=15.0,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("bloy_dev_agent: could not kill sandbox %s", sandbox_id)
+        return False
+    return response.status_code in (200, 202, 204, 404)
+
+
+def _owner_of(item: dict) -> tuple[str, str]:
+    """``(owner, run_id)`` from a sandbox's metadata, tolerating shape drift."""
+    meta = item.get("metadata") or item.get("Metadata") or {}
+    if not isinstance(meta, dict):
+        return "", ""
+    return str(meta.get("owner") or ""), str(meta.get("run_id") or "")
+
+
+def reap_orphan_sandboxes(active_run_ids: set[str]) -> list[str]:
+    """Kill our sandboxes whose run is no longer in flight.
+
+    Only sandboxes carrying :data:`OWNER_TAG` are touched — the server may be
+    shared, and killing a stranger's container would be far worse than leaving
+    one of ours running a few minutes longer.
+    """
+    killed: list[str] = []
+    for item in list_sandboxes():
+        sandbox_id = str(item.get("id") or item.get("sandboxId") or "")
+        owner, run_id = _owner_of(item)
+        if not sandbox_id or owner != OWNER_TAG:
+            continue
+        if run_id and run_id in active_run_ids:
+            continue
+        if kill_sandbox(sandbox_id):
+            killed.append(sandbox_id)
+            logger.warning(
+                "bloy_dev_agent: đã dọn sandbox mồ côi %s (run %s)",
+                sandbox_id,
+                run_id or "?",
+            )
+    return killed

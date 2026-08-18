@@ -383,3 +383,67 @@ def test_bam_is_only_a_warning_when_absent(monkeypatch):
     check = preflight._check_bam()
 
     assert check.state == preflight.WARN
+
+
+# ---------------------------------------------------------------------------
+# A multi-repo run must show every merge request
+# ---------------------------------------------------------------------------
+
+
+def test_the_history_lists_one_link_per_repo(client):
+    """A single link sends the reviewer to whichever repo came first.
+
+    They would see half the change with nothing hinting the other half exists —
+    exactly what happened when BLS-2000 opened an api MR and a cms MR.
+    """
+    app, store = client
+    run_id = store.start_run(
+        issue_id="i-1", issue_key="BLS-2000", project_id="p-1", attempt=1
+    )
+    store.finish_run(
+        run_id, state="success", stage="done",
+        merge_request_url="https://gitlab/api/mr/1",
+        merge_requests_json=json.dumps([
+            ["shopify-app-loyalty-api", "https://gitlab/api/mr/1"],
+            ["shopify-app-loyalty-cms", "https://gitlab/cms/mr/2"],
+        ]),
+    )
+
+    text = app.get("/").text
+
+    assert "https://gitlab/api/mr/1" in text
+    assert "https://gitlab/cms/mr/2" in text
+
+
+def test_an_older_single_url_row_still_renders(client):
+    """Rows written before multi-repo support must not vanish from history."""
+    app, store = client
+    run_id = store.start_run(
+        issue_id="i-2", issue_key="BLS-1080", project_id="p-1", attempt=1
+    )
+    store.finish_run(
+        run_id, state="success", stage="done",
+        merge_request_url="https://gitlab/api/mr/9",
+    )
+
+    text = app.get("/").text
+
+    assert "https://gitlab/api/mr/9" in text
+
+
+def test_unreadable_stored_json_does_not_break_the_page(client):
+    """A corrupt row must degrade, not 500 the dashboard."""
+    app, store = client
+    run_id = store.start_run(
+        issue_id="i-3", issue_key="BLS-1", project_id="p-1", attempt=1
+    )
+    store.finish_run(
+        run_id, state="success", stage="done",
+        merge_request_url="https://gitlab/api/mr/7",
+        merge_requests_json="{not json",
+    )
+
+    response = app.get("/")
+
+    assert response.status_code == 200
+    assert "https://gitlab/api/mr/7" in response.text

@@ -599,3 +599,461 @@ def test_a_normal_ticket_is_unaffected(monkeypatch, monorepo, tmp_path):
     _, outcome = _run(monkeypatch, monorepo, tmp_path, sandbox_result=ok, changed=True)
 
     assert (outcome.advice, outcome.merge_request_url) == (False, "https://gitlab/mr/9")
+
+
+# ---------------------------------------------------------------------------
+# Lockfiles never reach a merge request
+# ---------------------------------------------------------------------------
+
+
+def test_a_modified_lockfile_is_reverted(monorepo: Path, tmp_path: Path):
+    """BLS-1080 shipped one meaningful line beside 179 lines of lockfile churn."""
+    repo = monorepo / "shopify-app-loyalty-api"
+    (repo / "package-lock.json").write_text('{"v":1}\n', encoding="utf-8")
+    _git(["add", "-A"], repo)
+    _git(["commit", "-m", "add lockfile"], repo)
+
+    space = workspace.prepare(
+        "BLS-1080", monorepo=monorepo, repo="shopify-app-loyalty-api", root=tmp_path / "wt"
+    )
+    (space.path / "package-lock.json").write_text('{"v":2, "churn":true}\n', encoding="utf-8")
+    (space.path / "real.ts").write_text("export const fix = 1\n", encoding="utf-8")
+
+    reverted = workspace.discard_lockfile_changes(space)
+
+    assert reverted == ["package-lock.json"]
+    assert (space.path / "package-lock.json").read_text() == '{"v":1}\n'
+    assert (space.path / "real.ts").exists(), "the real change must survive"
+    assert workspace.has_changes(space) is True
+
+
+def test_an_untracked_lockfile_is_deleted(monorepo: Path, tmp_path: Path):
+    """`npm install` in a repo without one creates the lockfile from scratch."""
+    space = workspace.prepare(
+        "BLS-1081", monorepo=monorepo, repo="shopify-app-loyalty-api", root=tmp_path / "wt"
+    )
+    (space.path / "yarn.lock").write_text("# generated\n", encoding="utf-8")
+
+    reverted = workspace.discard_lockfile_changes(space)
+
+    assert reverted == ["yarn.lock"]
+    assert not (space.path / "yarn.lock").exists()
+    assert workspace.has_changes(space) is False
+
+
+def test_a_lockfile_in_a_subdirectory_is_caught(monorepo: Path, tmp_path: Path):
+    """Monorepos hold lockfiles per package, not only at the root."""
+    space = workspace.prepare(
+        "BLS-1082", monorepo=monorepo, repo="shopify-app-loyalty-api", root=tmp_path / "wt"
+    )
+    nested = space.path / "extensions" / "core"
+    nested.mkdir(parents=True)
+    (nested / "pnpm-lock.yaml").write_text("lockfileVersion: 6\n", encoding="utf-8")
+
+    reverted = workspace.discard_lockfile_changes(space)
+
+    assert reverted == ["extensions/core/pnpm-lock.yaml"]
+
+
+def test_files_that_merely_look_like_lockfiles_are_kept():
+    """The guard matches whole filenames, not substrings."""
+    for name in ("package.json", "my-yarn.lock.md", "lock.ts", "package-lock.json.bak"):
+        assert name not in workspace.LOCKFILES
+
+
+def test_a_run_whose_only_output_was_a_lockfile_is_not_a_success(
+    monkeypatch, monorepo, tmp_path
+):
+    """Otherwise it would open an MR containing nothing but churn."""
+    ok = pipeline.sandbox_runner.SandboxResult(True, "đã chạy npm install", "sb", 0)
+    monkeypatch.setattr(pipeline.sandbox_runner, "run_in_sandbox", lambda *a, **k: ok)
+    monkeypatch.setattr(
+        pipeline.workspace, "discard_lockfile_changes", lambda s: ["package-lock.json"]
+    )
+    monkeypatch.setattr(pipeline.workspace, "has_changes", lambda s: False)
+    monkeypatch.setattr(
+        pipeline.workspace,
+        "commit_and_push",
+        lambda *a, **k: pytest.fail("must not commit a lockfile-only run"),
+    )
+    client = FakeTwenty()
+
+    outcome = pipeline.run_issue(
+        client,
+        ISSUE,
+        monorepo=monorepo,
+        target_repo="shopify-app-loyalty-api",
+        worktree_root=tmp_path / "wt",
+        statuses=STATUSES,
+    )
+
+    assert (outcome.ok, outcome.stage) == (False, "no-change")
+    assert "chỉ thay đổi lockfile" in outcome.detail
+
+
+def test_the_prompt_forbids_touching_lockfiles():
+    from bloy_dev_agent.features.twenty import mapping
+
+    issue = mapping.normalize_issue({"id": "x", "issueKey": "BLOY-1", "title": "t"})
+
+    prompt = mapping.build_prompt(issue, "/worktrees/x", implement=True)
+
+    assert "package-lock.json" in prompt
+    assert "npm ci" in prompt
+
+
+# ---------------------------------------------------------------------------
+# Business reasoning must reach the reviewer
+# ---------------------------------------------------------------------------
+
+
+def test_the_prompt_points_at_the_product_documentation():
+    """The docs were always mounted and always ignored — nothing pointed at them."""
+    from bloy_dev_agent.features.twenty import mapping
+
+    issue = mapping.normalize_issue({"id": "x", "issueKey": "B-1", "title": "t"})
+
+    prompt = mapping.build_prompt(
+        issue, "/worktrees/x", implement=True, monorepo="/monorepo"
+    )
+
+    assert f"/monorepo/{mapping.DOCS_DIR}" in prompt
+    assert "GIẢ ĐỊNH CHƯA XÁC MINH" in prompt
+
+
+def test_the_prompt_rejects_a_config_dependent_fix():
+    """BLS-1066 shipped a fix that only worked if the merchant had ticked a box."""
+    from bloy_dev_agent.features.twenty import mapping
+
+    issue = mapping.normalize_issue({"id": "x", "issueKey": "B-1", "title": "t"})
+
+    prompt = mapping.build_prompt(
+        issue, "/worktrees/x", implement=True, monorepo="/monorepo"
+    )
+
+    assert "merchant happened to configure" in prompt
+    assert "has not fixed the bug" in prompt
+
+
+def test_no_business_section_without_the_docs_mount():
+    """Pointing at a path the container cannot see would only mislead."""
+    from bloy_dev_agent.features.twenty import mapping
+
+    issue = mapping.normalize_issue({"id": "x", "issueKey": "B-1", "title": "t"})
+
+    prompt = mapping.build_prompt(issue, "/worktrees/x", implement=True)
+
+    assert mapping.DOCS_DIR not in prompt
+
+
+def test_the_agent_report_reaches_the_reviewer_on_success(monkeypatch, monorepo, tmp_path):
+    """A diffstat and a link tell a reviewer nothing about where the risk is.
+
+    BLS-1066's fatal premise was stated plainly in the agent's own report and
+    never left the machine.
+    """
+    report = (
+        "Luật nghiệp vụ: gift card là chuyển tiền, không phải mua hàng.\n\n"
+        "GIẢ ĐỊNH CHƯA XÁC MINH\n- line item của POS custom amount có product_id"
+    )
+    ok = pipeline.sandbox_runner.SandboxResult(True, report, "sb-1", 0)
+
+    client, outcome = _run(monkeypatch, monorepo, tmp_path, sandbox_result=ok, changed=True)
+
+    posted = mapping_text(client.comments[0])
+    assert outcome.ok is True
+    assert "Báo cáo của agent" in posted
+    assert "GIẢ ĐỊNH CHƯA XÁC MINH" in posted
+    assert "gift card là chuyển tiền" in posted
+
+
+def mapping_text(stored: str) -> str:
+    """Decode a recorded blocknote payload back to plain text."""
+    from bloy_dev_agent.features.twenty import mapping
+
+    return mapping.blocknote_to_text(ast.literal_eval(stored)["bodyV2"])
+
+
+# ---------------------------------------------------------------------------
+# A worktree must branch from the remote, not from a stale checkout
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def monorepo_with_remote(tmp_path: Path) -> tuple[Path, Path]:
+    """A sub-project whose local master is behind its origin."""
+    remote = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "--bare", "-b", "master", str(remote)],
+                   check=True, capture_output=True)
+
+    root = tmp_path / "BLOY"
+    repo = root / "shopify-app-loyalty-api"
+    repo.mkdir(parents=True)
+    _git(["init", "-b", "master"], repo)
+    _git(["config", "user.email", "dev@example.com"], repo)
+    _git(["config", "user.name", "Dev Agent Test"], repo)
+    (repo / "README.md").write_text("v1\n", encoding="utf-8")
+    _git(["add", "-A"], repo)
+    _git(["commit", "-m", "v1"], repo)
+    _git(["remote", "add", "origin", str(remote)], repo)
+    _git(["push", "-q", "origin", "master"], repo)
+
+    # Someone else pushes v2; this checkout never pulls it.
+    other = tmp_path / "other"
+    subprocess.run(["git", "clone", "-q", str(remote), str(other)],
+                   check=True, capture_output=True)
+    _git(["config", "user.email", "other@example.com"], other)
+    _git(["config", "user.name", "Other Dev"], other)
+    (other / "README.md").write_text("v2\n", encoding="utf-8")
+    _git(["commit", "-am", "v2"], other)
+    _git(["push", "-q", "origin", "master"], other)
+
+    return root, repo
+
+
+def test_a_worktree_branches_from_the_remote_not_the_stale_checkout(
+    monorepo_with_remote, tmp_path
+):
+    """An unattended machine goes stale within a day.
+
+    Building a merge request on stale master hands the reviewer conflicts, or a
+    "fix" for something already fixed upstream.
+    """
+    root, repo = monorepo_with_remote
+    assert (repo / "README.md").read_text() == "v1\n", "local checkout is behind"
+
+    space = workspace.prepare(
+        "BLS-9", monorepo=root, repo="shopify-app-loyalty-api", root=tmp_path / "wt"
+    )
+
+    assert (space.path / "README.md").read_text() == "v2\n"
+
+
+def test_an_unreachable_remote_still_produces_a_worktree(monorepo, tmp_path):
+    """Offline must degrade to the local base, not refuse the ticket."""
+    space = workspace.prepare(
+        "BLS-10", monorepo=monorepo, repo="shopify-app-loyalty-api", root=tmp_path / "wt"
+    )
+
+    assert space.path.exists()
+    assert space.branch == "bloy/bls-10"
+
+
+# ---------------------------------------------------------------------------
+# One ticket, several sub-projects
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def two_repo_monorepo(tmp_path: Path) -> Path:
+    """A monorepo with both sub-projects a customer change usually spans."""
+    root = tmp_path / "BLOY"
+    for name in ("shopify-app-loyalty-api", "shopify-app-loyalty-cms"):
+        repo = root / name
+        repo.mkdir(parents=True)
+        _git(["init", "-b", "master"], repo)
+        _git(["config", "user.email", "dev@example.com"], repo)
+        _git(["config", "user.name", "Dev Agent Test"], repo)
+        (repo / "README.md").write_text(f"{name}\n", encoding="utf-8")
+        _git(["add", "-A"], repo)
+        _git(["commit", "-m", "init"], repo)
+    return root
+
+
+MULTI_ISSUE = {
+    "id": "issue-multi",
+    "issueKey": "BLOY-99",
+    "title": "BLS-2000: sửa cả hai đầu",
+    "description": (
+        "Repos: shopify-app-loyalty-api, shopify-app-loyalty-cms\n"
+        "Luật ở api, màn hình ở cms."
+    ),
+}
+
+
+def _multi_run(monkeypatch, root, tmp_path, *, changed_repos, push_fails=()):
+    client = FakeTwenty()
+    seen = {}
+
+    def fake_sandbox(prompt, worktree, **kwargs):
+        seen["prompt"] = prompt
+        return pipeline.sandbox_runner.SandboxResult(True, "đã sửa cả hai", "sb", 0)
+
+    monkeypatch.setattr(pipeline.sandbox_runner, "run_in_sandbox", fake_sandbox)
+    monkeypatch.setattr(
+        pipeline.workspace, "has_changes", lambda s: s.repo in changed_repos
+    )
+    monkeypatch.setattr(pipeline.workspace, "diffstat", lambda s: f" {s.repo} | 1 +")
+    monkeypatch.setattr(pipeline.workspace, "discard_lockfile_changes", lambda s: [])
+
+    def fake_push(space, **kw):
+        if space.repo in push_fails:
+            return {"ok": False, "detail": "rejected"}
+        return {"ok": True, "merge_request_url": f"https://gitlab/{space.repo}/mr/1"}
+
+    monkeypatch.setattr(pipeline.workspace, "commit_and_push", fake_push)
+
+    outcome = pipeline.run_issue(
+        client, MULTI_ISSUE,
+        monorepo=root, target_repo="shopify-app-loyalty-api",
+        worktree_root=tmp_path / "wt", statuses=STATUSES,
+    )
+    return client, outcome, seen
+
+
+def test_one_ticket_opens_a_merge_request_per_repo(monkeypatch, two_repo_monorepo, tmp_path):
+    """A rule in the API and a screen in the CMS are one change to the customer."""
+    _, outcome, _ = _multi_run(
+        monkeypatch, two_repo_monorepo, tmp_path,
+        changed_repos={"shopify-app-loyalty-api", "shopify-app-loyalty-cms"},
+    )
+
+    assert outcome.ok is True
+    assert dict(outcome.merge_requests) == {
+        "shopify-app-loyalty-api": "https://gitlab/shopify-app-loyalty-api/mr/1",
+        "shopify-app-loyalty-cms": "https://gitlab/shopify-app-loyalty-cms/mr/1",
+    }
+
+
+def test_both_merge_requests_reach_the_reviewer(monkeypatch, two_repo_monorepo, tmp_path):
+    client, _, _ = _multi_run(
+        monkeypatch, two_repo_monorepo, tmp_path,
+        changed_repos={"shopify-app-loyalty-api", "shopify-app-loyalty-cms"},
+    )
+
+    posted = mapping_text(client.comments[0])
+    assert "shopify-app-loyalty-api: https://gitlab" in posted
+    assert "shopify-app-loyalty-cms: https://gitlab" in posted
+
+
+def test_a_repo_the_agent_left_alone_gets_no_empty_merge_request(
+    monkeypatch, two_repo_monorepo, tmp_path
+):
+    """An empty merge request is worse than none."""
+    _, outcome, _ = _multi_run(
+        monkeypatch, two_repo_monorepo, tmp_path,
+        changed_repos={"shopify-app-loyalty-api"},
+    )
+
+    assert [repo for repo, _ in outcome.merge_requests] == ["shopify-app-loyalty-api"]
+
+
+def test_a_half_pushed_change_is_reported_as_failed(
+    monkeypatch, two_repo_monorepo, tmp_path
+):
+    """Seeing one MR and no warning, a reviewer would merge half a change."""
+    _, outcome, _ = _multi_run(
+        monkeypatch, two_repo_monorepo, tmp_path,
+        changed_repos={"shopify-app-loyalty-api", "shopify-app-loyalty-cms"},
+        push_fails={"shopify-app-loyalty-cms"},
+    )
+
+    assert outcome.ok is False
+    assert "shopify-app-loyalty-cms" in outcome.detail
+    assert len(outcome.merge_requests) == 1, "the one that landed is still reported"
+
+
+def test_the_prompt_names_every_worktree(monkeypatch, two_repo_monorepo, tmp_path):
+    _, _, seen = _multi_run(
+        monkeypatch, two_repo_monorepo, tmp_path,
+        changed_repos={"shopify-app-loyalty-api"},
+    )
+
+    assert "bls-2000-shopify-app-loyalty-api" in seen["prompt"]
+    assert "bls-2000-shopify-app-loyalty-cms" in seen["prompt"]
+
+
+def test_a_single_repo_ticket_is_unchanged(monkeypatch, monorepo, tmp_path):
+    """Only the marker opts a ticket into multi-repo."""
+    ok = pipeline.sandbox_runner.SandboxResult(True, "đã sửa", "sb", 0)
+
+    _, outcome = _run(monkeypatch, monorepo, tmp_path, sandbox_result=ok, changed=True)
+
+    assert outcome.ok is True
+    assert outcome.merge_request_url == "https://gitlab/mr/9"
+
+
+# ---------------------------------------------------------------------------
+# The base is the repo's integration branch, never the developer's checkout
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def repo_on_a_feature_branch(tmp_path: Path) -> tuple[Path, Path]:
+    """A checkout parked on a feature branch with unpushed commits.
+
+    This is the ordinary state of a developer's machine, and it is what made a
+    merge request carry two of their commits and target their branch.
+    """
+    remote = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "--bare", "-b", "master", str(remote)],
+                   check=True, capture_output=True)
+
+    root = tmp_path / "BLOY"
+    repo = root / "shopify-app-loyalty-api"
+    repo.mkdir(parents=True)
+    _git(["init", "-b", "master"], repo)
+    _git(["config", "user.email", "dev@example.com"], repo)
+    _git(["config", "user.name", "Dev"], repo)
+    (repo / "README.md").write_text("on master\n", encoding="utf-8")
+    _git(["add", "-A"], repo)
+    _git(["commit", "-m", "master work"], repo)
+    _git(["remote", "add", "origin", str(remote)], repo)
+    _git(["push", "-q", "origin", "master"], repo)
+    _git(["remote", "set-head", "origin", "master"], repo)
+
+    # The developer's own branch, with work they have not pushed.
+    _git(["checkout", "-q", "-b", "bugFixSupport/BLS-1064"], repo)
+    (repo / "wip.txt").write_text("chưa push\n", encoding="utf-8")
+    _git(["add", "-A"], repo)
+    _git(["commit", "-m", "opt liquid"], repo)
+    return root, repo
+
+
+def test_the_base_ignores_the_checked_out_feature_branch(repo_on_a_feature_branch):
+    root, repo = repo_on_a_feature_branch
+    assert workspace._git(["rev-parse", "--abbrev-ref", "HEAD"], repo).stdout.strip() == (
+        "bugFixSupport/BLS-1064"
+    )
+
+    assert workspace.default_base(repo) == "master"
+
+
+def test_a_worktree_carries_none_of_the_developer_unpushed_work(
+    repo_on_a_feature_branch, tmp_path
+):
+    """The reviewer saw 19 changed files where the agent had touched 3."""
+    root, _ = repo_on_a_feature_branch
+
+    space = workspace.prepare(
+        "BLS-2000", monorepo=root, repo="shopify-app-loyalty-api", root=tmp_path / "wt"
+    )
+
+    assert space.base_branch == "master"
+    assert not (space.path / "wip.txt").exists(), "inherited the developer's commit"
+
+
+def test_the_merge_request_targets_the_integration_branch(
+    repo_on_a_feature_branch, tmp_path, monkeypatch
+):
+    """Targeting a personal branch quietly makes the change unmergeable."""
+    root, _ = repo_on_a_feature_branch
+    space = workspace.prepare(
+        "BLS-2001", monorepo=root, repo="shopify-app-loyalty-api", root=tmp_path / "wt"
+    )
+    (space.path / "fix.ts").write_text("export const x = 1\n", encoding="utf-8")
+
+    seen: list[list[str]] = []
+    real = workspace._git
+
+    def fake_git(args, cwd):
+        if args[0] == "push":
+            seen.append(args)
+            return subprocess.CompletedProcess(args, 0, "", "")
+        return real(args, cwd)
+
+    monkeypatch.setattr(workspace, "_git", fake_git)
+    workspace.commit_and_push(space, title="BLS-2001: fix")
+
+    (push,) = seen
+    assert "merge_request.target=master" in push

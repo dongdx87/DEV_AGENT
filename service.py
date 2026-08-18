@@ -16,6 +16,7 @@ thread is the whole scheduler it needs.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import threading
@@ -27,9 +28,9 @@ from fastapi import BackgroundTasks, FastAPI, Form, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
-from bloy_dev_agent import preflight, store
+from bloy_dev_agent import preflight, setup_wizard, store
 from bloy_dev_agent.db import database_url, init_db
-from bloy_dev_agent.features import agent_log, pipeline, workspace
+from bloy_dev_agent.features import agent_log, pipeline, sandbox_runner, workspace
 from bloy_dev_agent.models import BloyPipelineRun
 
 logger = logging.getLogger(__name__)
@@ -38,6 +39,12 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 TEMPLATES = Jinja2Templates(directory=str(PROJECT_ROOT / "templates"))
 
 DEFAULT_PORT = 8100
+
+#: Where the sub-projects are cloned from when the setup page fills in a
+#: missing one. Overridable from that page for a different group or fork.
+DEFAULT_GIT_REMOTE = (
+    "git@sbc-gitlab.bsscommerce.com:sa-division/tc-team/shopify-app-loyalty"
+)
 PAGE_TITLE = "BLOY Dev Agent"
 
 
@@ -148,6 +155,20 @@ def _reap_on_boot() -> None:
     disappeared from the board twice.
     """
     stale = store.reap_stale_runs()
+
+    # A sandbox outlives the process that made it: killing the service mid-run
+    # leaves the container burning CPU until its own timeout. Nothing is in
+    # flight at boot, so every sandbox of ours is an orphan.
+    try:
+        killed = sandbox_runner.reap_orphan_sandboxes(active_run_ids=set())
+        if killed:
+            logger.warning(
+                "bloy_dev_agent: đã dọn %d sandbox mồ côi: %s",
+                len(killed), ", ".join(killed),
+            )
+    except Exception:  # noqa: BLE001 — boot must not fail on the sweep
+        logger.exception("bloy_dev_agent: orphan sandbox sweep failed")
+
     saved = store.get_settings()
     project_id = saved.get(store.SETTING_PROJECT_ID) or ""
 
@@ -190,13 +211,31 @@ def _reap_on_boot() -> None:
             logger.exception("bloy_dev_agent: stranded-issue sweep failed")
 
 
+def twenty_credentials() -> tuple[str, str]:
+    """``(base_url, api_key)`` from the environment, else from Settings.
+
+    The environment wins so a deployment that injects secrets keeps working,
+    but Settings means a fresh machine can be configured entirely from the
+    browser instead of by hand-editing a file.
+    """
+    saved = store.get_settings()
+    base = (
+        os.environ.get("BLOY_TWENTY_BASE_URL", "").strip()
+        or saved.get(store.SETTING_TWENTY_URL, "").strip()
+    )
+    key = (
+        os.environ.get("BLOY_TWENTY_API_KEY", "").strip()
+        or saved.get(store.SETTING_TWENTY_KEY, "").strip()
+    )
+    return base, key
+
+
 def _twenty_client():
     from bloy_dev_agent.features.twenty.client import TwentyClient
 
-    base = os.environ.get("BLOY_TWENTY_BASE_URL", "").strip()
-    key = os.environ.get("BLOY_TWENTY_API_KEY", "").strip()
+    base, key = twenty_credentials()
     if not base or not key:
-        raise RuntimeError("BLOY_TWENTY_BASE_URL and BLOY_TWENTY_API_KEY are not set")
+        raise RuntimeError("Twenty chưa được cấu hình — điền ở trang Setup")
     return TwentyClient(base_url=base, api_key=key)
 
 
@@ -253,6 +292,22 @@ def _elapsed(run: BloyPipelineRun) -> str:
     return f"{seconds}s" if seconds < 60 else f"{seconds // 60}m {seconds % 60:02d}s"
 
 
+def _merge_requests(run: BloyPipelineRun) -> list[tuple[str, str]]:
+    """Every merge request the run opened, oldest schema tolerated.
+
+    Rows written before multi-repo support carry only ``merge_request_url``;
+    they still have to render, so the single URL is presented as one unnamed
+    entry rather than vanishing from the history table.
+    """
+    raw = getattr(run, "merge_requests_json", None)
+    if raw:
+        try:
+            return [(str(a), str(b)) for a, b in json.loads(raw)]
+        except (ValueError, TypeError):
+            logger.warning("bloy_dev_agent: unreadable merge_requests_json on %s", run.id)
+    return [("", run.merge_request_url)] if run.merge_request_url else []
+
+
 def _run_view(run: BloyPipelineRun) -> dict:
     return {
         "id": run.id,
@@ -264,6 +319,7 @@ def _run_view(run: BloyPipelineRun) -> dict:
         "stage": run.stage or "",
         "branch": run.branch or "",
         "merge_request_url": run.merge_request_url or "",
+        "merge_requests": _merge_requests(run),
         "sandbox_id": run.sandbox_id or "",
         "target_repo": run.target_repo or "",
         "changed": run.changed or "",
@@ -398,6 +454,111 @@ def create_app() -> FastAPI:
             }
         )
         return RedirectResponse(url="/settings", status_code=303)
+
+    # ---------------- setup ----------------
+
+    def _setup_context(request: Request, message: str = "") -> dict:
+        saved = store.get_settings()
+        url, key = twenty_credentials()
+        monorepo = Path(saved.get(store.SETTING_MONOREPO) or pipeline.DEFAULT_MONOREPO)
+        steps = setup_wizard.diagnose(
+            monorepo=monorepo,
+            worktree_root=workspace.DEFAULT_WORKTREE_ROOT,
+            repos=workspace.KNOWN_REPOS,
+            twenty_url=url,
+            twenty_key=key,
+        )
+        counts: dict[str, int] = {}
+        for step in steps:
+            counts[step.state] = counts.get(step.state, 0) + 1
+        return _shell(
+            request,
+            title=f"Setup · {PAGE_TITLE}",
+            steps=steps,
+            counts=counts,
+            ready=counts.get(setup_wizard.FAIL, 0) == 0,
+            message=message,
+            twenty_url=url,
+            twenty_key=key,
+            monorepo=str(monorepo),
+            git_remote=saved.get(store.SETTING_GIT_REMOTE) or DEFAULT_GIT_REMOTE,
+        )
+
+    @app.get("/setup")
+    def setup_page(request: Request):
+        return TEMPLATES.TemplateResponse(
+            request=request, name="bloy_setup.html", context=_setup_context(request)
+        )
+
+    @app.post("/setup")
+    def save_setup(
+        twenty_base_url: str = Form(default=""),
+        twenty_api_key: str = Form(default=""),
+        monorepo: str = Form(default=""),
+        git_remote: str = Form(default=""),
+    ):
+        values = {
+            store.SETTING_TWENTY_URL: twenty_base_url.strip(),
+            store.SETTING_MONOREPO: monorepo.strip(),
+            store.SETTING_GIT_REMOTE: git_remote.strip(),
+        }
+        # An empty key field means "leave it alone", not "erase it" — the form
+        # renders the stored key as a password input and a blank submit would
+        # otherwise silently wipe a working credential.
+        if twenty_api_key.strip():
+            values[store.SETTING_TWENTY_KEY] = twenty_api_key.strip()
+        store.save_settings(values)
+        return RedirectResponse(url="/setup", status_code=303)
+
+    @app.post("/setup/fix/{action}")
+    def apply_fix(request: Request, action: str):
+        """Run one named repair. Only the fixed set is reachable."""
+        if action not in setup_wizard.FIXES:
+            return RedirectResponse(url="/setup", status_code=303)
+
+        saved = store.get_settings()
+        monorepo = Path(saved.get(store.SETTING_MONOREPO) or pipeline.DEFAULT_MONOREPO)
+        try:
+            if action == "write_sandbox_config":
+                message = setup_wizard.write_sandbox_config([
+                    str(monorepo),
+                    str(workspace.DEFAULT_WORKTREE_ROOT),
+                    str(Path.home() / ".nvm"),
+                    str(Path.home() / ".claude"),
+                ])
+            elif action == "start_sandbox_server":
+                message = setup_wizard.start_sandbox_server()
+            else:
+                message = setup_wizard.clone_repos(
+                    monorepo,
+                    workspace.KNOWN_REPOS,
+                    saved.get(store.SETTING_GIT_REMOTE) or DEFAULT_GIT_REMOTE,
+                )
+        except Exception as exc:  # noqa: BLE001 — report, never 500 the setup page
+            logger.exception("bloy_dev_agent: setup fix %s failed", action)
+            message = f"{action} lỗi: {type(exc).__name__}: {exc}"
+
+        return TEMPLATES.TemplateResponse(
+            request=request,
+            name="bloy_setup.html",
+            context=_setup_context(request, message=message),
+        )
+
+    @app.get("/api/setup")
+    def setup_json():
+        url, key = twenty_credentials()
+        saved = store.get_settings()
+        steps = setup_wizard.diagnose(
+            monorepo=Path(saved.get(store.SETTING_MONOREPO) or pipeline.DEFAULT_MONOREPO),
+            worktree_root=workspace.DEFAULT_WORKTREE_ROOT,
+            repos=workspace.KNOWN_REPOS,
+            twenty_url=url,
+            twenty_key=key,
+        )
+        return {
+            "ready": all(s.state != setup_wizard.FAIL for s in steps),
+            "steps": [asdict(s) for s in steps],
+        }
 
     @app.get("/preflight")
     def preflight_page(request: Request):
