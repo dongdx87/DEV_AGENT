@@ -529,10 +529,10 @@ def create_app() -> FastAPI:
     def _setup_context(request: Request, message: str = "") -> dict:
         saved = store.get_settings()
         url, key = twenty_credentials()
-        monorepo = Path(saved.get(store.SETTING_MONOREPO) or pipeline.DEFAULT_MONOREPO)
+        monorepo = Path(saved.get(store.SETTING_MONOREPO) or pipeline.default_monorepo())
         steps = setup_wizard.diagnose(
             monorepo=monorepo,
-            worktree_root=workspace.DEFAULT_WORKTREE_ROOT,
+            worktree_root=workspace.default_worktree_root(),
             repos=workspace.KNOWN_REPOS,
             twenty_url=url,
             twenty_key=key,
@@ -590,12 +590,12 @@ def create_app() -> FastAPI:
             return RedirectResponse(url="/setup", status_code=303)
 
         saved = store.get_settings()
-        monorepo = Path(saved.get(store.SETTING_MONOREPO) or pipeline.DEFAULT_MONOREPO)
+        monorepo = Path(saved.get(store.SETTING_MONOREPO) or pipeline.default_monorepo())
         try:
             if action == "write_sandbox_config":
                 message = setup_wizard.write_sandbox_config([
                     str(monorepo),
-                    str(workspace.DEFAULT_WORKTREE_ROOT),
+                    str(workspace.default_worktree_root()),
                     str(Path.home() / ".nvm"),
                     str(Path.home() / ".claude"),
                     saved.get(store.SETTING_SKILLS_ROOT) or str(skill_packs.DEFAULT_SKILLS_ROOT),
@@ -626,8 +626,8 @@ def create_app() -> FastAPI:
         url, key = twenty_credentials()
         saved = store.get_settings()
         steps = setup_wizard.diagnose(
-            monorepo=Path(saved.get(store.SETTING_MONOREPO) or pipeline.DEFAULT_MONOREPO),
-            worktree_root=workspace.DEFAULT_WORKTREE_ROOT,
+            monorepo=Path(saved.get(store.SETTING_MONOREPO) or pipeline.default_monorepo()),
+            worktree_root=workspace.default_worktree_root(),
             repos=workspace.KNOWN_REPOS,
             twenty_url=url,
             twenty_key=key,
