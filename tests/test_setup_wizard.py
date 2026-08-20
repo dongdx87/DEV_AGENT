@@ -131,6 +131,129 @@ def test_every_offered_fix_is_in_the_allowlist(config, tmp_path):
             assert step.fix in setup_wizard.FIXES, f"{step.key} offers {step.fix!r}"
 
 
+def test_a_skill_packs_root_is_required_only_when_given(config, tmp_path):
+    """A mount OpenSandbox will reject outside the allowlist must be listed —
+    but only once something actually asks for it to be mounted.
+    """
+    monorepo, worktree_root = tmp_path / "BLOY", tmp_path / "wt"
+    packs_root = tmp_path / "packs"
+    setup_wizard.write_sandbox_config(
+        [str(monorepo), str(worktree_root), str(Path.home() / ".nvm"), str(Path.home() / ".claude")]
+    )
+
+    without_packs = setup_wizard.diagnose(
+        monorepo=monorepo, worktree_root=worktree_root,
+        repos=("shopify-app-loyalty-api",), twenty_url="", twenty_key="",
+    )
+    step = next(s for s in without_packs if s.key == "sandbox_config")
+    assert step.state == setup_wizard.OK
+
+    with_packs = setup_wizard.diagnose(
+        monorepo=monorepo, worktree_root=worktree_root,
+        repos=("shopify-app-loyalty-api",), twenty_url="", twenty_key="",
+        skill_packs_root=packs_root,
+    )
+    step = next(s for s in with_packs if s.key == "sandbox_config")
+    assert step.state == setup_wizard.FAIL
+    assert str(packs_root) in step.detail
+
+
+# ---------------------------------------------------------------------------
+# Egress mode (dns -> dns+nft)
+# ---------------------------------------------------------------------------
+
+
+def test_egress_mode_dns_is_flagged_as_only_filtering_dns(config):
+    """`dns` mode never blocks a direct-by-IP connection — only the DNS lookup."""
+    setup_wizard.write_sandbox_config(["/a"])  # template default is mode = "dns"
+
+    step = setup_wizard.check_egress_mode()
+
+    assert step.state == setup_wizard.WARN
+    assert step.fix == "write_egress_mode"
+
+
+def test_egress_mode_dns_plus_nft_passes(config):
+    setup_wizard.write_sandbox_config(["/a"])
+    setup_wizard.write_egress_mode("dns+nft")
+
+    assert setup_wizard.check_egress_mode().state == setup_wizard.OK
+
+
+def test_missing_config_reports_egress_mode_as_warn_not_crash(config):
+    step = setup_wizard.check_egress_mode()
+
+    assert step.state == setup_wizard.WARN
+
+
+def test_write_egress_mode_touches_only_the_egress_block(config):
+    """[ingress] has its own `mode` key — flipping the wrong one would break
+    ingress instead of hardening egress."""
+    setup_wizard.write_sandbox_config(["/a"])
+
+    setup_wizard.write_egress_mode("dns+nft")
+
+    data = tomllib.loads(config.read_text(encoding="utf-8"))
+    assert data["egress"]["mode"] == "dns+nft"
+    assert data["ingress"]["mode"] == "direct"
+
+
+def test_write_egress_mode_on_a_missing_file_does_not_crash(config):
+    message = setup_wizard.write_egress_mode()
+
+    assert "Chưa có" in message
+    assert not config.exists()
+
+
+def test_egress_mode_is_in_the_diagnose_output(config, tmp_path):
+    setup_wizard.write_sandbox_config(["/a"])
+
+    steps = setup_wizard.diagnose(
+        monorepo=tmp_path / "BLOY", worktree_root=tmp_path / "wt",
+        repos=("shopify-app-loyalty-api",), twenty_url="", twenty_key="",
+    )
+
+    assert any(s.key == "egress_mode" for s in steps)
+
+
+def test_staging_probe_is_opt_in(config, tmp_path):
+    """An ordinary ticket never talks to staging-control — its diagnostic
+    probe must not run unless a caller explicitly asks for it."""
+    setup_wizard.write_sandbox_config(["/a"])
+
+    steps = setup_wizard.diagnose(
+        monorepo=tmp_path / "BLOY", worktree_root=tmp_path / "wt",
+        repos=("shopify-app-loyalty-api",), twenty_url="", twenty_key="",
+    )
+
+    assert not any(s.key == "staging" for s in steps)
+
+
+def test_staging_probe_runs_when_requested(config, tmp_path):
+    setup_wizard.write_sandbox_config(["/a"])
+
+    steps = setup_wizard.diagnose(
+        monorepo=tmp_path / "BLOY", worktree_root=tmp_path / "wt",
+        repos=("shopify-app-loyalty-api",), twenty_url="", twenty_key="",
+        include_staging=True,
+    )
+
+    assert any(s.key == "staging" for s in steps)
+
+
+def test_check_staging_reports_warn_when_unreachable(monkeypatch):
+    """Point at a port nothing listens on — must not be confused with the
+    real staging-control service that may actually be running on this host."""
+    from bloy_dev_agent.staging_control import service as staging_service
+
+    monkeypatch.setattr(staging_service, "host", lambda: "127.0.0.1")
+    monkeypatch.setattr(staging_service, "port", lambda: 1)
+
+    step = setup_wizard.check_staging()
+
+    assert step.state == setup_wizard.WARN
+
+
 def test_diagnose_never_raises(tmp_path):
     """A setup page that 500s hides the very problem it exists to surface."""
     steps = setup_wizard.diagnose(

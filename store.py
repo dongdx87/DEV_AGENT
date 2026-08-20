@@ -26,7 +26,15 @@ logger = logging.getLogger(__name__)
 #: pass costs a sandbox plus a full agent session.
 DEFAULT_MAX_ATTEMPTS = 5
 
+#: How many times to retry the sandbox stage *within one run* before letting
+#: the attempt fail. This is not the attempt cap above: a transient sandbox
+#: failure ("AI gặp lỗi ở process 2") is retried in place, same run_id, no new
+#: comment — only after this many tries in a row fail does it count as one
+#: failed attempt against DEFAULT_MAX_ATTEMPTS.
+DEFAULT_SANDBOX_STAGE_RETRIES = 3
+
 SETTING_MAX_ATTEMPTS = "max_attempts"
+SETTING_SANDBOX_STAGE_RETRIES = "sandbox_stage_retries"
 SETTING_PROJECT_ID = "project_id"
 SETTING_TARGET_REPO = "target_repo"
 SETTING_MONOREPO = "monorepo"
@@ -45,6 +53,13 @@ SETTING_TWENTY_KEY = "twenty_api_key"
 
 #: Prefix used when the setup page clones a missing sub-project.
 SETTING_GIT_REMOTE = "git_remote"
+
+#: Where the shared skill-pack store lives, and which packs the Skills page has
+#: turned on (comma-separated names). Selection lives here rather than in the
+#: pack store itself, because that store is shared with BAM's own agents and
+#: this service only ever runs one.
+SETTING_SKILLS_ROOT = "skills_root"
+SETTING_ENABLED_SKILLS = "enabled_skills"
 
 
 def _now() -> datetime:
@@ -98,6 +113,15 @@ def max_attempts() -> int:
         return max(1, int(raw))
     except (TypeError, ValueError):
         return DEFAULT_MAX_ATTEMPTS
+
+
+def sandbox_stage_retries() -> int:
+    """Configured in-run sandbox retry count, or the default when unset or nonsense."""
+    raw = get_settings().get(SETTING_SANDBOX_STAGE_RETRIES, "")
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        return DEFAULT_SANDBOX_STAGE_RETRIES
 
 
 # ---------------------------------------------------------------------------

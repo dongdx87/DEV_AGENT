@@ -27,7 +27,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from bloy_dev_agent import store
-from bloy_dev_agent.features import agent_log, sandbox_runner, workspace
+from bloy_dev_agent.features import agent_log, sandbox_runner, skill_packs, workspace
 from bloy_dev_agent.features.twenty import mapping
 from bloy_dev_agent.features.twenty.client import TwentyClient, TwentyError
 from bloy_dev_agent.models import BloyPipelineRun
@@ -40,12 +40,26 @@ DEFAULT_TARGET_REPO = "shopify-app-loyalty-api"
 DEFAULT_SOURCE_STATUS = "Todo"
 DEFAULT_WORKING_STATUS = "In Progress"
 DEFAULT_DONE_STATUS = "In Review"
-DEFAULT_ERROR_STATUS = "Todo"
 
 #: Where a blocked issue goes. Deliberately *not* the source column: putting it
 #: back where it came from would let the next pass pick it up, run the cap check
 #: again and re-block it forever, which is a loop with no work in it.
 DEFAULT_BLOCKED_STATUS = "Backlog"
+
+#: Where a failed (non-blocked) run goes. Used to be the same column as
+#: DEFAULT_SOURCE_STATUS, which meant a failed issue was picked straight back
+#: up by the very next pass and the whole pipeline reran from scratch — a
+#: fresh run_id, a fresh comment, every time. That silent auto-retry-of-the-
+#: whole-issue is what turned into comment spam. Retrying is now a human
+#: decision (drag the card back to the source column, "Reset attempts" first
+#: if the cap was hit) — the only retry that still happens automatically is
+#: the in-place sandbox-stage loop inside run_issue.
+DEFAULT_ERROR_STATUS = DEFAULT_BLOCKED_STATUS
+
+#: Temporary: paused because the bug above made every silent auto-retry post
+#: its own comment to Twenty ("spam"). Flip back to True once the fix above
+#: has been confirmed to actually stop the spam in production.
+COMMENTS_ENABLED = False
 
 
 def project_id_of(record: dict) -> str:
@@ -161,6 +175,8 @@ def release_stranded_issues(
 
 
 def _comment(client: TwentyClient, issue_id: str, text: str) -> None:
+    if not COMMENTS_ENABLED:
+        return
     try:
         client.create_record(
             "issueComments",
@@ -234,6 +250,8 @@ def run_issue(
     timeout_minutes: int = sandbox_runner.DEFAULT_TIMEOUT_MINUTES,
     create_mr: bool = True,
     blocked_status: str = DEFAULT_BLOCKED_STATUS,
+    skill_packs_root: Path = skill_packs.DEFAULT_SKILLS_ROOT,
+    enabled_skill_names: tuple[str, ...] = (),
 ) -> PipelineOutcome:
     """Take one issue all the way to a merge request."""
     issue = mapping.normalize_issue(record)
@@ -330,6 +348,14 @@ def run_issue(
     workdirs = [
         sandbox_runner.container_path(s.path, worktree_root) for s in spaces
     ]
+    # Resolved from the catalog each run, rather than trusting stale names in
+    # settings: a pack removed or renamed from the store since it was enabled
+    # should quietly drop out, not break the run.
+    enabled_packs = [
+        pack
+        for pack in skill_packs.list_packs(skill_packs_root)
+        if pack.name in enabled_skill_names
+    ]
     prompt = mapping.build_prompt(
         issue,
         workdirs[0],
@@ -337,16 +363,32 @@ def run_issue(
         monorepo=sandbox_runner.MONOREPO_MOUNT,
         advice=advice,
         extra_workdirs=workdirs[1:],
+        enabled_skills=[(p.name, p.description) for p in enabled_packs],
     )
-    result = sandbox_runner.run_in_sandbox(
-        prompt,
-        space.path,
-        worktree_root=worktree_root,
-        timeout_minutes=timeout_minutes,
-        implement=not advice,
-        run_id=run_id,
-        monorepo=monorepo,
-    )
+    # Retry *this stage*, in place, same run_id — not a new attempt, not a new
+    # comment. A transient sandbox failure ("AI gặp lỗi ở process 2") used to
+    # mean the whole issue got requeued and rerun from scratch; now only this
+    # stage retries, and only the final result of the loop is reported.
+    stage_retries = store.sandbox_stage_retries()
+    for stage_attempt in range(1, stage_retries + 1):
+        result = sandbox_runner.run_in_sandbox(
+            prompt,
+            space.path,
+            worktree_root=worktree_root,
+            timeout_minutes=timeout_minutes,
+            implement=not advice,
+            run_id=run_id,
+            monorepo=monorepo,
+            enabled_skills=enabled_packs,
+            skill_packs_root=skill_packs_root,
+        )
+        if result.ok or stage_attempt == stage_retries:
+            break
+        logger.info(
+            "bloy_dev_agent: sandbox thất bại ở %s (lần %d/%d trong cùng run "
+            "%s), thử lại ngay tại chỗ",
+            issue.key, stage_attempt, stage_retries, run_id,
+        )
     store.set_stage(run_id, "verify", sandbox_id=result.sandbox_id, output=result.output)
     if not result.ok:
         outcome = PipelineOutcome(
@@ -531,6 +573,8 @@ def run_pass(
     timeout_minutes: int = sandbox_runner.DEFAULT_TIMEOUT_MINUTES,
     create_mr: bool = True,
     blocked_status: str = DEFAULT_BLOCKED_STATUS,
+    skill_packs_root: Path = skill_packs.DEFAULT_SKILLS_ROOT,
+    enabled_skill_names: tuple[str, ...] = (),
 ) -> dict:
     """Pick issues from the source column and take each to a merge request."""
     statuses = statuses_by_name(client, project_id)
@@ -562,6 +606,8 @@ def run_pass(
             timeout_minutes=timeout_minutes,
             create_mr=create_mr,
             blocked_status=blocked_status,
+            skill_packs_root=skill_packs_root,
+            enabled_skill_names=enabled_skill_names,
         )
         for record in candidates
     ]

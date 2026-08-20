@@ -240,10 +240,34 @@ _PROMPT_TEMPLATE = textwrap.dedent("""\
 
     {business}
 
+    {skills}
+
     {task}
 
     Be concrete and short. Do not restate the ticket.
     """)
+
+
+def _skills_block(enabled_skills: list[tuple[str, str]] | None) -> str:
+    """A catalog of enabled skills, not their content.
+
+    Only the name and description reach the prompt — the same shape agent_team
+    uses (``cli_context.py``'s manifest) — because the agent can read a
+    ``SKILL.md`` itself once it recognises it applies. Nailing every skill's
+    full text into the prompt would grow it on every ticket whether or not the
+    skill is relevant.
+    """
+    if not enabled_skills:
+        return ""
+    lines = [
+        "## Available skills",
+        "",
+        "Each is a folder at ~/.claude/skills/<name>/SKILL.md. Read one when it "
+        "matches what you are doing — it is not loaded into this prompt for you.",
+        "",
+    ]
+    lines += [f"- `{name}`: {description}" for name, description in enabled_skills]
+    return "\n".join(lines)
 
 
 def build_prompt(
@@ -254,6 +278,7 @@ def build_prompt(
     monorepo: str = "",
     advice: bool = False,
     extra_workdirs: list[str] | None = None,
+    enabled_skills: list[tuple[str, str]] | None = None,
 ) -> str:
     """Compose the instruction sent to the coding agent.
 
@@ -318,6 +343,7 @@ def build_prompt(
     return _PROMPT_TEMPLATE.format(
         key=issue.key,
         business=business,
+        skills=_skills_block(enabled_skills),
         title=issue.title,
         status=issue.status_name,
         body=body,

@@ -30,7 +30,13 @@ from fastapi.templating import Jinja2Templates
 
 from bloy_dev_agent import preflight, setup_wizard, store
 from bloy_dev_agent.db import database_url, init_db
-from bloy_dev_agent.features import agent_log, pipeline, sandbox_runner, workspace
+from bloy_dev_agent.features import (
+    agent_log,
+    pipeline,
+    sandbox_runner,
+    skill_packs,
+    workspace,
+)
 from bloy_dev_agent.models import BloyPipelineRun
 
 logger = logging.getLogger(__name__)
@@ -259,6 +265,11 @@ def run_pass_from_config(config: dict) -> dict:
     except ValueError:
         timeout = 0
 
+    skills_root = Path(pick(store.SETTING_SKILLS_ROOT, str(skill_packs.DEFAULT_SKILLS_ROOT)))
+    enabled_names = tuple(
+        skill_packs.parse_enabled(saved.get(store.SETTING_ENABLED_SKILLS) or "")
+    )
+
     return pipeline.run_pass(
         _twenty_client(),
         project_id=project_id,
@@ -271,6 +282,8 @@ def run_pass_from_config(config: dict) -> dict:
         blocked_status=pick(store.SETTING_BLOCKED_STATUS, pipeline.DEFAULT_BLOCKED_STATUS),
         max_issues=int(config.get("max_issues") or 1),
         timeout_minutes=timeout or 30,
+        skill_packs_root=skills_root,
+        enabled_skill_names=enabled_names,
     )
 
 
@@ -455,6 +468,62 @@ def create_app() -> FastAPI:
         )
         return RedirectResponse(url="/settings", status_code=303)
 
+    # ---------------- skills ----------------
+    #
+    # This is a *selector*, not an editor. Authoring happens in the shared
+    # skill-pack store BAM's own Skill Packs page already manages (import from
+    # git, sync, versioning); duplicating that here would give the team two
+    # places to look for the same thing. This page only reads that store off
+    # disk and remembers which of its packs this agent should use.
+
+    def _skills_root() -> Path:
+        saved = store.get_settings()
+        return Path(
+            saved.get(store.SETTING_SKILLS_ROOT) or str(skill_packs.DEFAULT_SKILLS_ROOT)
+        )
+
+    @app.get("/skills")
+    def skills_page(request: Request):
+        saved = store.get_settings()
+        root = _skills_root()
+        enabled = set(skill_packs.parse_enabled(saved.get(store.SETTING_ENABLED_SKILLS) or ""))
+        packs = skill_packs.list_packs(root)
+        return TEMPLATES.TemplateResponse(
+            request=request,
+            name="bloy_skills.html",
+            context=_shell(
+                request,
+                title=f"Skills · {PAGE_TITLE}",
+                skills_root=str(root),
+                root_exists=root.is_dir(),
+                packs=[
+                    {"name": p.name, "description": p.description, "path": str(p.path)}
+                    for p in packs
+                ],
+                enabled=enabled,
+            ),
+        )
+
+    @app.post("/skills")
+    def save_skills_route(
+        skills_root: str = Form(default=""),
+        skill: list[str] = Form(default=[]),
+    ):
+        # Every submitted name is checked against the actual catalog rather
+        # than trusted as-is, so a crafted field cannot enable something that
+        # names no real pack.
+        root = Path(skills_root.strip()) if skills_root.strip() else _skills_root()
+        known = {p.name for p in skill_packs.list_packs(root)}
+        chosen = [name for name in skill if name in known]
+        values = {store.SETTING_ENABLED_SKILLS: ",".join(chosen)}
+        # A blank field means "leave the root alone", not "erase it" — the
+        # form always renders the current root as the input's value, so a
+        # blank submit here only happens if a caller strips it deliberately.
+        if skills_root.strip():
+            values[store.SETTING_SKILLS_ROOT] = skills_root.strip()
+        store.save_settings(values)
+        return RedirectResponse(url="/skills", status_code=303)
+
     # ---------------- setup ----------------
 
     def _setup_context(request: Request, message: str = "") -> dict:
@@ -467,6 +536,10 @@ def create_app() -> FastAPI:
             repos=workspace.KNOWN_REPOS,
             twenty_url=url,
             twenty_key=key,
+            skill_packs_root=Path(
+                saved.get(store.SETTING_SKILLS_ROOT) or skill_packs.DEFAULT_SKILLS_ROOT
+            ),
+            monorepo_mirror=sandbox_runner.DEFAULT_MONOREPO_MIRROR,
         )
         counts: dict[str, int] = {}
         for step in steps:
@@ -525,7 +598,11 @@ def create_app() -> FastAPI:
                     str(workspace.DEFAULT_WORKTREE_ROOT),
                     str(Path.home() / ".nvm"),
                     str(Path.home() / ".claude"),
+                    saved.get(store.SETTING_SKILLS_ROOT) or str(skill_packs.DEFAULT_SKILLS_ROOT),
+                    str(sandbox_runner.DEFAULT_MONOREPO_MIRROR),
                 ])
+            elif action == "write_egress_mode":
+                message = setup_wizard.write_egress_mode()
             elif action == "start_sandbox_server":
                 message = setup_wizard.start_sandbox_server()
             else:
@@ -554,6 +631,10 @@ def create_app() -> FastAPI:
             repos=workspace.KNOWN_REPOS,
             twenty_url=url,
             twenty_key=key,
+            skill_packs_root=Path(
+                saved.get(store.SETTING_SKILLS_ROOT) or skill_packs.DEFAULT_SKILLS_ROOT
+            ),
+            monorepo_mirror=sandbox_runner.DEFAULT_MONOREPO_MIRROR,
         )
         return {
             "ready": all(s.state != setup_wizard.FAIL for s in steps),

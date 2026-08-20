@@ -1,0 +1,82 @@
+{% extends "base.html" %}
+
+{% set input_cls = "w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/30 focus:border-indigo-500" %}
+
+{% block content %}
+<div class="max-w-3xl mx-auto space-y-5">
+
+  <div class="bg-white rounded-2xl shadow-sm border border-slate-200 p-6">
+    <nav class="text-xs text-slate-500">
+      <a href="/" class="hover:text-indigo-600">BLOY Dev Agent</a>
+      <span class="px-1">/</span><span>Skills</span>
+    </nav>
+    <h1 class="mt-1 text-2xl font-semibold tracking-tight text-slate-900">Skills</h1>
+    <p class="mt-1 text-sm text-slate-500 max-w-prose">
+      Chọn skill cho agent trong sandbox dùng — trang này KHÔNG phải chỗ soạn skill.
+      Nội dung skill được viết và versioned ở kho dùng chung, cùng chỗ BAM's
+      <a href="{{ bam_url }}/skill-packs" class="text-indigo-600 hover:text-indigo-500">Skill Packs</a>
+      đọc — import từ git, sync, xem nội dung ở đó. Trang này chỉ bật/tắt và nhớ lựa chọn cho agent này.
+    </p>
+  </div>
+
+  {% if not root_exists %}
+  <div class="rounded-2xl border border-rose-300 bg-rose-50 px-5 py-3 text-sm text-rose-900">
+    Không thấy thư mục <code class="text-xs">{{ skills_root }}</code>. Chưa có skill pack
+    nào để chọn — sửa đường dẫn bên dưới nếu kho nằm chỗ khác, hoặc tạo thư mục đó trước.
+  </div>
+  {% elif not packs %}
+  <div class="rounded-2xl border border-amber-300 bg-amber-50 px-5 py-3 text-sm text-amber-900">
+    Thư mục <code class="text-xs">{{ skills_root }}</code> tồn tại nhưng chưa có pack nào
+    (mỗi pack là một thư mục con chứa <code class="text-xs">SKILL.md</code>).
+  </div>
+  {% endif %}
+
+  <form method="post" action="/skills" class="space-y-5">
+    <section class="rounded-2xl border border-slate-200 bg-white shadow-sm p-5 space-y-3">
+      <div>
+        <label for="skills_root" class="block text-sm font-medium text-slate-800">Kho skill pack</label>
+        <input id="skills_root" name="skills_root" type="text" class="mt-1 {{ input_cls }}"
+               value="{{ skills_root }}">
+        <p class="mt-1 text-xs text-slate-500">
+          Mặc định là kho BAM's <code class="text-xs">skill_packs</code> plugin cũng đọc —
+          một kho, hai nơi dùng chung, không phải hai bản nội dung khác nhau.
+        </p>
+      </div>
+    </section>
+
+    {% if packs %}
+    <section class="rounded-2xl border border-slate-200 bg-white shadow-sm divide-y divide-slate-100">
+      {% for pack in packs %}
+      <label class="flex items-start gap-3 px-5 py-4 cursor-pointer hover:bg-slate-50">
+        <input type="checkbox" name="skill" value="{{ pack.name }}"
+               {% if pack.name in enabled %}checked{% endif %}
+               class="mt-1 h-4 w-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500/40">
+        <span class="min-w-0">
+          <span class="block text-sm font-semibold text-slate-900">{{ pack.name }}</span>
+          <span class="block text-sm text-slate-600">{{ pack.description or "(không có mô tả)" }}</span>
+          <span class="block text-xs text-slate-400 mt-0.5 break-all">{{ pack.path }}</span>
+        </span>
+      </label>
+      {% endfor %}
+    </section>
+    {% endif %}
+
+    <div class="flex items-center gap-2">
+      <button type="submit"
+        class="rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/40">
+        Lưu
+      </button>
+      <a href="/skills" class="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50">
+        Huỷ
+      </a>
+    </div>
+  </form>
+
+  <p class="text-xs text-slate-400 max-w-prose">
+    Skill được bật sẽ được copy read-only vào sandbox ở
+    <code class="text-xs">~/.claude/skills/&lt;tên&gt;/</code> của agent — nằm ngoài mọi
+    worktree, nên không lọt vào merge request. Chỉ tên khớp đúng một pack đang có trong
+    kho mới có hiệu lực; tên lạ bị bỏ qua.
+  </p>
+</div>
+{% endblock %}

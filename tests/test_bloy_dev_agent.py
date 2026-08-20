@@ -201,6 +201,83 @@ def test_settings_round_trip(client):
     assert "proj-1" in app.get("/settings").text
 
 
+# ---------------------------------------------------------------------------
+# Skills — a selector for the shared skill-pack store, not a second editor
+# ---------------------------------------------------------------------------
+
+
+def test_skills_page_renders_when_the_root_does_not_exist(client, tmp_path):
+    app, store = client
+    store.save_settings({store.SETTING_SKILLS_ROOT: str(tmp_path / "nope")})
+
+    response = app.get("/skills")
+
+    assert response.status_code == 200
+    assert "nope" in response.text
+
+
+def test_skills_page_lists_packs_found_at_the_configured_root(client, tmp_path):
+    app, store = client
+    root = tmp_path / "packs"
+    (root / "shared" / "demo").mkdir(parents=True)
+    (root / "shared" / "demo" / "SKILL.md").write_text(
+        "---\nname: demo\ndescription: a demo pack\n---\nbody", encoding="utf-8"
+    )
+    store.save_settings({store.SETTING_SKILLS_ROOT: str(root)})
+
+    response = app.get("/skills")
+
+    assert "demo" in response.text
+    assert "a demo pack" in response.text
+
+
+def test_enabling_a_skill_round_trips(client, tmp_path):
+    app, store = client
+    root = tmp_path / "packs"
+    (root / "shared" / "demo").mkdir(parents=True)
+    (root / "shared" / "demo" / "SKILL.md").write_text(
+        "---\nname: demo\n---\nbody", encoding="utf-8"
+    )
+
+    response = app.post(
+        "/skills",
+        data={"skills_root": str(root), "skill": ["demo"]},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert store.get_settings().get(store.SETTING_ENABLED_SKILLS) == "demo"
+    assert "checked" in app.get("/skills").text
+
+
+def test_a_name_that_matches_no_real_pack_is_dropped(client, tmp_path):
+    """A crafted field must not be able to enable something the catalog does
+    not actually contain.
+    """
+    app, store = client
+    root = tmp_path / "packs"
+    root.mkdir()
+
+    app.post(
+        "/skills",
+        data={"skills_root": str(root), "skill": ["not-a-real-pack"]},
+        follow_redirects=False,
+    )
+
+    assert store.get_settings().get(store.SETTING_ENABLED_SKILLS, "") == ""
+
+
+def test_a_blank_root_on_save_does_not_erase_a_configured_one(client, tmp_path):
+    app, store = client
+    root = tmp_path / "packs"
+    root.mkdir()
+    store.save_settings({store.SETTING_SKILLS_ROOT: str(root)})
+
+    app.post("/skills", data={"skills_root": ""}, follow_redirects=False)
+
+    assert store.get_settings().get(store.SETTING_SKILLS_ROOT) == str(root)
+
+
 def test_preflight_page_and_json_agree(client):
     app, _ = client
 

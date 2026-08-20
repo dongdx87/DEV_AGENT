@@ -139,6 +139,19 @@ def test_the_log_lives_outside_every_worktree(tmp_path):
     )
 
 
+def test_the_skills_dir_also_lives_outside_every_worktree(tmp_path):
+    """Same reasoning as the log: a copy inside a worktree gets committed."""
+    root = tmp_path / "worktrees"
+
+    path = agent_log.host_skills_dir(root, "abc123")
+
+    assert path == root / agent_log.SKILLS_DIR_NAME / "abc123"
+    assert agent_log.SKILLS_DIR_NAME.startswith("."), "hidden so tooling skips it"
+    assert agent_log.container_skills_dir("/worktrees", "abc123") == (
+        f"/worktrees/{agent_log.SKILLS_DIR_NAME}/abc123"
+    )
+
+
 def test_progress_counts_what_the_dashboard_shows(tmp_path):
     path = _write(
         tmp_path,

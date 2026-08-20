@@ -266,6 +266,57 @@ def check_git_ssh(monorepo: Path, repos: tuple[str, ...]) -> Step:
     return Step("git_ssh", "GitLab SSH", OK, "origin trả lời — push và mở MR được")
 
 
+def check_egress_mode() -> Step:
+    if not SANDBOX_CONFIG.exists():
+        return Step("egress_mode", "Egress mode", WARN, "Chưa có cấu hình để kiểm tra.")
+    try:
+        config = tomllib.loads(SANDBOX_CONFIG.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return Step("egress_mode", "Egress mode", WARN, "Không đọc được file cấu hình.")
+    mode = str((config.get("egress") or {}).get("mode") or "")
+    if mode == "dns+nft":
+        return Step(
+            "egress_mode", "Egress mode", OK,
+            "dns+nft — chặn theo địa chỉ IP, không chỉ theo câu hỏi DNS.",
+        )
+    detail = f'Đang là "{mode}"' if mode else "Chưa có [egress].mode"
+    return Step(
+        "egress_mode", "Egress mode", WARN,
+        f"{detail} — chỉ lọc DNS, không chặn nối thẳng bằng IP.",
+        fix="write_egress_mode", fix_label='Đổi [egress].mode thành "dns+nft"',
+        why="Một sandbox biết trước địa chỉ IP vẫn nối thẳng được dù DNS bị chặn — "
+            "đây là cách mọi run trước đây vẫn với tới được MongoDB/Redis/MySQL trên "
+            "gateway Docker. Đổi xong phải tự bấm restart server (không tự động, để "
+            "không cắt ngang sandbox đang chạy dở).",
+    )
+
+
+def check_staging() -> Step:
+    """Whether the staging-control service (:8110) answers at all.
+
+    Only meaningful once a run actually opts into staging-verify — an ordinary
+    ticket never calls this service — so the caller decides whether to include
+    this probe rather than it running unconditionally.
+    """
+    import httpx
+
+    from bloy_dev_agent.staging_control import service as staging_service
+
+    host, port = staging_service.host(), staging_service.port()
+    try:
+        response = httpx.get(f"http://{host}:{port}/v1/status", timeout=3.0)
+    except Exception as exc:  # noqa: BLE001 — any failure just means "not reachable"
+        return Step(
+            "staging", "Staging-control", WARN,
+            f"Không kết nối được {host}:{port}: {exc}",
+        )
+    # A 401 still proves the process itself is up and answering — every route
+    # requires a bearer token, so an unauthenticated probe never gets a 200.
+    if response.status_code in (200, 401):
+        return Step("staging", "Staging-control", OK, f"{host}:{port} đang chạy")
+    return Step("staging", "Staging-control", WARN, f"HTTP {response.status_code}")
+
+
 def check_twenty(base_url: str, api_key: str) -> Step:
     missing = [n for n, v in (("URL", base_url), ("API key", api_key)) if not v]
     if missing:
@@ -313,6 +364,36 @@ def write_sandbox_config(allowed_paths: list[str], *, host: str = "127.0.0.1",
     SANDBOX_CONFIG.chmod(0o600)  # it holds the only secret protecting the server
     logger.info("bloy_dev_agent: wrote %s", SANDBOX_CONFIG)
     return f"Đã ghi {SANDBOX_CONFIG} (quyền 600)"
+
+
+def write_egress_mode(mode: str = "dns+nft") -> str:
+    """Repair only the ``[egress]`` block's ``mode`` key.
+
+    ``[ingress]`` has a key of the same name — a blind top-level
+    ``^mode\\s*=`` regex over the whole file would hit whichever one comes
+    first, which happens to be ``[ingress]``. This isolates the ``[egress]``
+    block's own lines before substituting.
+    """
+    if not SANDBOX_CONFIG.exists():
+        return f"Chưa có {SANDBOX_CONFIG} — tạo file cấu hình trước."
+    text = SANDBOX_CONFIG.read_text(encoding="utf-8")
+    match = re.search(r"^\[egress\]\n(?:(?!^\[).*\n?)*", text, flags=re.M)
+    if match is None:
+        return "Không tìm thấy block [egress] trong file — không sửa gì."
+    block = match.group(0)
+    if re.search(r"^mode\s*=", block, flags=re.M):
+        new_block = re.sub(r'^mode\s*=.*$', f'mode = "{mode}"', block, count=1, flags=re.M)
+    else:
+        new_block = block.rstrip("\n") + f'\nmode = "{mode}"\n'
+    text = text[: match.start()] + new_block + text[match.end() :]
+    SANDBOX_CONFIG.write_text(text, encoding="utf-8")
+    SANDBOX_CONFIG.chmod(0o600)
+    logger.info("bloy_dev_agent: [egress].mode -> %s in %s", mode, SANDBOX_CONFIG)
+    return (
+        f'Đã đổi [egress].mode thành "{mode}" — CHƯA restart opensandbox-server '
+        "(cố ý, để không cắt ngang sandbox đang chạy dở); bấm nút restart riêng "
+        "khi không còn run nào đang hoạt động."
+    )
 
 
 def start_sandbox_server() -> str:
@@ -369,6 +450,7 @@ def clone_repos(monorepo: Path, repos: tuple[str, ...], remote_prefix: str) -> s
 #: lookup by attribute, so a crafted key can never reach an arbitrary callable.
 FIXES = {
     "write_sandbox_config",
+    "write_egress_mode",
     "start_sandbox_server",
     "clone_repos",
 }
@@ -381,10 +463,24 @@ def diagnose(
     repos: tuple[str, ...],
     twenty_url: str,
     twenty_key: str,
+    skill_packs_root: Path | None = None,
+    monorepo_mirror: Path | None = None,
+    include_staging: bool = False,
 ) -> list[Step]:
     """Run every check, converting a crash into a reportable failure."""
     required = [str(monorepo), str(worktree_root), str(Path.home() / ".nvm"),
                 str(Path.home() / ".claude")]
+    if skill_packs_root is not None:
+        # Only required once a pack is actually mounted — the sandbox has no
+        # opinion on a directory it never binds — but listing it here means
+        # the same "Tạo file cấu hình" fix that repairs everything else also
+        # covers this path, instead of a second silent-rejection bug to find.
+        required.append(str(skill_packs_root))
+    if monorepo_mirror is not None:
+        # The filtered mirror sandbox_runner mounts instead of the real
+        # monorepo (see its module docstring) — a sibling directory, so it
+        # needs its own entry in the allowlist.
+        required.append(str(monorepo_mirror))
     probes = [
         lambda: check_docker(),
         lambda: check_sandbox_config(required),
@@ -395,7 +491,13 @@ def diagnose(
         lambda: check_claude_login(),
         lambda: check_git_ssh(monorepo, repos),
         lambda: check_twenty(twenty_url, twenty_key),
+        lambda: check_egress_mode(),
     ]
+    if include_staging:
+        # Only meaningful once a caller actually cares about staging-verify —
+        # an ordinary run never talks to this service, so it stays out of the
+        # default probe list.
+        probes.append(lambda: check_staging())
     steps: list[Step] = []
     for probe in probes:
         try:

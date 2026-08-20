@@ -184,3 +184,32 @@ class BloyTwentyTaskLink(Base):
     )
 
     note: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class BloyStagingToken(Base):
+    """A capability grant letting one pipeline run deploy to shared staging.
+
+    Not an API key: the token is minted per run, scoped to that run's own
+    worktrees, and revoked the moment the run ends (see
+    ``features/pipeline.py``'s ``_finish``). Only the SHA-256 is stored, never
+    the raw token — the raw value exists only in the sandbox's environment and
+    in the moment it was minted.
+    """
+
+    __tablename__ = "plugin_bloy_staging_token"
+
+    run_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    token_sha256: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    issue_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    #: JSON object ``{repo_name: host_worktree_path}`` — the only paths this
+    #: token's holder may rsync from. A caller-supplied path is never trusted.
+    worktrees_json: Mapped[str] = mapped_column(Text, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    deploys_used: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_deploy_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )

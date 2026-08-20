@@ -163,11 +163,20 @@ class FakeTwenty:
 
 
 ISSUE = {"id": "issue-1", "issueKey": "BLOY-2", "name": "Sửa lỗi tính điểm"}
-STATUSES = {"In Progress": "s-wip", "In Review": "s-review", "Todo": "s-todo"}
+STATUSES = {
+    "In Progress": "s-wip",
+    "In Review": "s-review",
+    "Todo": "s-todo",
+    "Backlog": "s-backlog",
+}
 
 
 def _run(monkeypatch, monorepo, tmp_path, *, sandbox_result, changed: bool):
     client = FakeTwenty()
+    # Comments are paused by default in production right now (see
+    # pipeline.COMMENTS_ENABLED); most of these tests are pinning report
+    # *content*, which is a separate concern from whether the toggle is on.
+    monkeypatch.setattr(pipeline, "COMMENTS_ENABLED", True)
     monkeypatch.setattr(
         pipeline.sandbox_runner, "run_in_sandbox", lambda *a, **k: sandbox_result
     )
@@ -216,7 +225,10 @@ def test_a_run_that_changed_nothing_is_not_a_success(monkeypatch, monorepo, tmp_
     client, outcome = _run(monkeypatch, monorepo, tmp_path, sandbox_result=ok, changed=False)
 
     assert (outcome.ok, outcome.stage) == (False, "no-change")
-    assert outcome.moved_to == "Todo", "must go back to the source column, not to review"
+    assert outcome.moved_to == "Backlog", (
+        "must not go back to the source column — that would let the next pass "
+        "rerun the whole issue from scratch instead of a human deciding to retry"
+    )
 
 
 def test_a_failed_sandbox_never_reaches_git(monkeypatch, monorepo, tmp_path):
@@ -238,6 +250,101 @@ def test_a_failed_sandbox_never_reaches_git(monkeypatch, monorepo, tmp_path):
     )
 
     assert (outcome.ok, outcome.stage) == (False, "sandbox")
+
+
+def test_comments_to_twenty_are_off_by_default(monkeypatch, monorepo, tmp_path, cap_db):
+    """Temporary: retrying-the-whole-issue used to post one comment per silent
+    auto-retry — spam. Paused via pipeline.COMMENTS_ENABLED until that's
+    confirmed fixed in production; flip it back to True to re-enable.
+    """
+    ok = pipeline.sandbox_runner.SandboxResult(True, "đã sửa", "sb-1", 0)
+    monkeypatch.setattr(pipeline.sandbox_runner, "run_in_sandbox", lambda *a, **k: ok)
+    monkeypatch.setattr(pipeline.workspace, "has_changes", lambda space: True)
+    monkeypatch.setattr(pipeline.workspace, "diffstat", lambda space: " a | 1 +")
+    monkeypatch.setattr(
+        pipeline.workspace,
+        "commit_and_push",
+        lambda space, **kw: {"ok": True, "merge_request_url": "https://gitlab/mr/1"},
+    )
+    client = FakeTwenty()
+
+    pipeline.run_issue(
+        client,
+        ISSUE,
+        monorepo=monorepo,
+        target_repo="shopify-app-loyalty-api",
+        worktree_root=tmp_path / "wt",
+        statuses=STATUSES,
+    )
+
+    assert client.comments == []
+
+
+def test_a_transient_sandbox_failure_is_retried_within_the_same_run(
+    monkeypatch, monorepo, tmp_path, cap_db
+):
+    """"AI gặp lỗi ở process 2 ở issue A" must retry that stage in place — same
+    run_id, same attempt, one report at the end — not requeue the whole issue.
+    """
+    calls = {"n": 0}
+    bad = pipeline.sandbox_runner.SandboxResult(False, "flaky", "sb-bad", 1)
+    ok = pipeline.sandbox_runner.SandboxResult(True, "đã sửa", "sb-good", 0)
+
+    def fake_sandbox(*a, **k):
+        calls["n"] += 1
+        return bad if calls["n"] < 3 else ok
+
+    monkeypatch.setattr(pipeline.sandbox_runner, "run_in_sandbox", fake_sandbox)
+    monkeypatch.setattr(pipeline.workspace, "has_changes", lambda space: True)
+    monkeypatch.setattr(pipeline.workspace, "diffstat", lambda space: " a | 1 +")
+    monkeypatch.setattr(
+        pipeline.workspace,
+        "commit_and_push",
+        lambda space, **kw: {"ok": True, "merge_request_url": "https://gitlab/mr/3"},
+    )
+    monkeypatch.setattr(pipeline, "COMMENTS_ENABLED", True)
+    client = FakeTwenty()
+
+    outcome = pipeline.run_issue(
+        client,
+        ISSUE,
+        monorepo=monorepo,
+        target_repo="shopify-app-loyalty-api",
+        worktree_root=tmp_path / "wt",
+        statuses=STATUSES,
+    )
+
+    assert calls["n"] == 3
+    assert outcome.ok is True
+    assert len(client.comments) == 1, "one attempt, one report — not one per retry"
+    assert cap_db.attempt_status("issue-1", "BLOY-2").failed == 0
+
+
+def test_a_sandbox_that_never_recovers_still_counts_as_one_attempt(
+    monkeypatch, monorepo, tmp_path, cap_db
+):
+    """The in-stage retry must not inflate the attempt cap: N sandbox tries
+    that all fail is still one failed *attempt*, not N."""
+    bad = pipeline.sandbox_runner.SandboxResult(False, "container died", "sb", 1)
+    calls = {"n": 0}
+
+    def fake_sandbox(*a, **k):
+        calls["n"] += 1
+        return bad
+
+    monkeypatch.setattr(pipeline.sandbox_runner, "run_in_sandbox", fake_sandbox)
+
+    pipeline.run_issue(
+        FakeTwenty(),
+        ISSUE,
+        monorepo=monorepo,
+        target_repo="shopify-app-loyalty-api",
+        worktree_root=tmp_path / "wt",
+        statuses=STATUSES,
+    )
+
+    assert calls["n"] == cap_db.sandbox_stage_retries()
+    assert cap_db.attempt_status("issue-1", "BLOY-2").failed == 1
 
 
 # ---------------------------------------------------------------------------
@@ -269,6 +376,7 @@ def cap_db(monkeypatch, tmp_path):
 
 def test_the_cap_stops_the_run_before_any_money_is_spent(monkeypatch, monorepo, tmp_path, cap_db):
     """Blocked means: no claim, no worktree, no container — nothing billable."""
+    monkeypatch.setattr(pipeline, "COMMENTS_ENABLED", True)
     cap_db.save_settings({cap_db.SETTING_MAX_ATTEMPTS: "2"})
     for _ in range(2):
         run_id = cap_db.start_run(
@@ -415,6 +523,45 @@ def test_the_sandbox_is_told_the_run_id_so_it_can_stream(monkeypatch, monorepo, 
     assert seen.get("run_id") == outcome.run_id
 
 
+def test_an_enabled_skill_reaches_both_the_prompt_and_the_sandbox_call(
+    monkeypatch, monorepo, tmp_path, cap_db
+):
+    """The setting names a pack; the pipeline must resolve it from the catalog
+    and hand the same pack to both the prompt (as a one-line description) and
+    the sandbox (to be copied in) — not trust the name blindly either place.
+    """
+    packs_root = tmp_path / "packs"
+    (packs_root / "shared" / "bloy-sandbox-dev").mkdir(parents=True)
+    (packs_root / "shared" / "bloy-sandbox-dev" / "SKILL.md").write_text(
+        "---\nname: bloy-sandbox-dev\ndescription: checklist bug tiềm ẩn\n---\nbody",
+        encoding="utf-8",
+    )
+
+    seen = {}
+
+    def fake_sandbox(prompt, worktree, **kwargs):
+        seen["prompt"] = prompt
+        seen["enabled_skills"] = kwargs.get("enabled_skills")
+        return pipeline.sandbox_runner.SandboxResult(False, "x", "sb", 1)
+
+    monkeypatch.setattr(pipeline.sandbox_runner, "run_in_sandbox", fake_sandbox)
+
+    pipeline.run_issue(
+        FakeTwenty(),
+        ISSUE,
+        monorepo=monorepo,
+        target_repo="shopify-app-loyalty-api",
+        worktree_root=tmp_path / "wt",
+        statuses=STATUSES,
+        skill_packs_root=packs_root,
+        enabled_skill_names=("bloy-sandbox-dev", "not-a-real-pack"),
+    )
+
+    assert "## Available skills" in seen["prompt"]
+    assert "bloy-sandbox-dev" in seen["prompt"]
+    assert [p.name for p in seen["enabled_skills"]] == ["bloy-sandbox-dev"]
+
+
 def test_the_pipeline_needs_no_bam_to_run():
     """The pipeline moved into the standalone service, so it must not need BAM.
 
@@ -523,6 +670,7 @@ ADVICE_ISSUE = {
 
 def _advice_run(monkeypatch, monorepo, tmp_path, *, output):
     client = FakeTwenty()
+    monkeypatch.setattr(pipeline, "COMMENTS_ENABLED", True)
     seen = {}
 
     def fake_sandbox(prompt, worktree, **kwargs):
@@ -873,6 +1021,7 @@ MULTI_ISSUE = {
 
 def _multi_run(monkeypatch, root, tmp_path, *, changed_repos, push_fails=()):
     client = FakeTwenty()
+    monkeypatch.setattr(pipeline, "COMMENTS_ENABLED", True)
     seen = {}
 
     def fake_sandbox(prompt, worktree, **kwargs):

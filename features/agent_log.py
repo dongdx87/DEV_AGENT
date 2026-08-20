@@ -26,6 +26,15 @@ logger = logging.getLogger(__name__)
 #: inside a worktree would show up as an untracked change and get committed.
 LOG_DIR_NAME = ".bloy-logs"
 
+#: Same idea, for materialised skill packs. A pack copied straight into the
+#: container's own $HOME vanishes with the container — nothing on the host
+#: ever shows what a run actually had available, unlike the worktree or this
+#: log. Landing it here instead, one subfolder per run, means it survives the
+#: container and sits where a human can go look at it after the fact — the
+#: same reason agent_team's own task workspaces are inspectable directories,
+#: not something thrown away at the end of a run.
+SKILLS_DIR_NAME = ".bloy-skills"
+
 KIND_THINKING = "thinking"
 KIND_TEXT = "text"
 KIND_TOOL = "tool"
@@ -54,6 +63,16 @@ def host_log_path(worktree_root: Path, run_id: str) -> Path:
 def container_log_path(mount: str, run_id: str) -> str:
     """The same file as the container sees it."""
     return f"{mount}/{LOG_DIR_NAME}/{run_id}.jsonl"
+
+
+def host_skills_dir(worktree_root: Path, run_id: str) -> Path:
+    """Where the host can inspect what skills a run actually had."""
+    return worktree_root / SKILLS_DIR_NAME / run_id
+
+
+def container_skills_dir(mount: str, run_id: str) -> str:
+    """The same directory as the container sees it."""
+    return f"{mount}/{SKILLS_DIR_NAME}/{run_id}"
 
 
 def _tool_summary(block: dict) -> str:
