@@ -1,10 +1,19 @@
-"""BLOY Dev Agent plugin.
+"""BLOY Dev Agent.
 
-Connects Twenty (task source) to the Agent Team board so BLOY development
-tasks can be picked up and executed by agents, and provides BLOY-specific
-capabilities (Shopify session capture, skill pack) to those agents.
+Pulls BLOY development tasks from Twenty, runs each one through a coding
+agent inside an isolated sandbox, and opens a merge request — as a
+standalone service (:mod:`bloy_dev_agent.service`) with its own process,
+port and database.
+
+``plugin.py`` is the thin BAM-facing shim: it contributes a sidebar link to
+the service and a routine action that triggers a pass over HTTP. Nothing
+else in this package may import BAM internals (``core.*``) — see
+``tests/test_bloy_dev_agent.py::test_the_service_imports_nothing_from_bam``.
 
 Layout:
-    features/twenty/   Twenty REST/GraphQL client, mapping, sync
-    features/bridge/   The ONLY place allowed to talk to the agent_team plugin
+    service.py       FastAPI app: dashboard, run detail, settings, API
+    features/twenty/  Twenty REST/GraphQL client, mapping
+    features/         pipeline, sandbox runner, workspace, agent log
+    plugin.py         BAM plugin shim (menu item + routine action)
+    trigger_action.py BAM routine action that calls the service over HTTP
 """

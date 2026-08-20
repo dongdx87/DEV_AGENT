@@ -256,7 +256,7 @@ def run_pass_from_config(config: dict) -> dict:
     if not project_id:
         return {"error": "project_id chưa được cấu hình"}
 
-    monorepo = Path(pick(store.SETTING_MONOREPO, str(pipeline.DEFAULT_MONOREPO)))
+    monorepo = Path(pick(store.SETTING_MONOREPO, str(pipeline.default_monorepo())))
     if not monorepo.is_dir():
         return {"error": f"Repository path không tồn tại: {monorepo}"}
 

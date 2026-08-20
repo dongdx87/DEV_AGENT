@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -34,7 +35,17 @@ from bloy_dev_agent.models import BloyPipelineRun
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MONOREPO = Path("/home/bss-group/BLOY")
+
+def default_monorepo() -> Path:
+    """Monorepo root, overridable per host via ``BLOY_MONOREPO``.
+
+    Read at call time rather than baked in as a module constant: this module
+    is imported before ``service.load_env()`` fills ``os.environ`` from
+    ``BLOY_DEV_AGENT/.env``, so a plain constant would miss that file.
+    """
+    return Path(os.environ.get("BLOY_MONOREPO", "/home/bss-group/BLOY"))
+
+
 DEFAULT_TARGET_REPO = "shopify-app-loyalty-api"
 
 DEFAULT_SOURCE_STATUS = "Todo"
@@ -240,9 +251,9 @@ def run_issue(
     client: TwentyClient,
     record: dict,
     *,
-    monorepo: Path = DEFAULT_MONOREPO,
+    monorepo: Path | None = None,
     target_repo: str = DEFAULT_TARGET_REPO,
-    worktree_root: Path = workspace.DEFAULT_WORKTREE_ROOT,
+    worktree_root: Path | None = None,
     statuses: dict[str, str],
     working_status: str = DEFAULT_WORKING_STATUS,
     done_status: str = DEFAULT_DONE_STATUS,
@@ -254,6 +265,10 @@ def run_issue(
     enabled_skill_names: tuple[str, ...] = (),
 ) -> PipelineOutcome:
     """Take one issue all the way to a merge request."""
+    monorepo = monorepo if monorepo is not None else default_monorepo()
+    worktree_root = (
+        worktree_root if worktree_root is not None else workspace.default_worktree_root()
+    )
     issue = mapping.normalize_issue(record)
 
     # --- attempt cap ------------------------------------------------------
@@ -563,7 +578,7 @@ def run_pass(
     client: TwentyClient,
     *,
     project_id: str,
-    monorepo: Path = DEFAULT_MONOREPO,
+    monorepo: Path | None = None,
     target_repo: str = DEFAULT_TARGET_REPO,
     source_status: str = DEFAULT_SOURCE_STATUS,
     working_status: str = DEFAULT_WORKING_STATUS,
@@ -577,6 +592,7 @@ def run_pass(
     enabled_skill_names: tuple[str, ...] = (),
 ) -> dict:
     """Pick issues from the source column and take each to a merge request."""
+    monorepo = monorepo if monorepo is not None else default_monorepo()
     statuses = statuses_by_name(client, project_id)
     source_id = statuses.get(source_status)
     if not source_id:
