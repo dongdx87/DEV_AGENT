@@ -102,6 +102,50 @@ def test_purge_expired_removes_only_expired_rows():
     assert tokens.check_rate_limit("run-live") == ""
 
 
+def test_no_active_token_means_staging_is_free():
+    assert tokens.active() is None
+
+
+def test_a_live_token_is_reported_active():
+    tokens.mint("run-a", issue_key="BLS-9", worktrees={}, ttl_minutes=30)
+
+    grant = tokens.active()
+
+    assert grant is not None
+    assert (grant.run_id, grant.issue_key) == ("run-a", "BLS-9")
+
+
+def test_an_expired_token_is_not_active():
+    tokens.mint("run-old", issue_key="BLS-1", worktrees={}, ttl_minutes=-100)
+
+    assert tokens.active() is None
+
+
+def test_a_revoked_token_is_not_active():
+    tokens.mint("run-a", issue_key="BLS-1", worktrees={}, ttl_minutes=30)
+    tokens.revoke("run-a")
+
+    assert tokens.active() is None
+
+
+def test_revoke_all_active_clears_every_unrevoked_row():
+    """Every not-yet-revoked row is stamped, expired or not — an expired row
+    left with revoked_at unset is just as much stale bookkeeping from a killed
+    process as a live one, and stamping it too is harmless."""
+    tokens.mint("run-a", issue_key="BLS-1", worktrees={}, ttl_minutes=30)
+    tokens.mint("run-b", issue_key="BLS-2", worktrees={}, ttl_minutes=30)
+    tokens.mint("run-dead", issue_key="BLS-3", worktrees={}, ttl_minutes=-100)
+
+    revoked = tokens.revoke_all_active()
+
+    assert revoked == 3
+    assert tokens.active() is None
+
+
+def test_revoke_all_active_is_a_noop_when_nothing_is_live():
+    assert tokens.revoke_all_active() == 0
+
+
 # ---------------------------------------------------------------------------
 # actions.py — no subprocess ever fires for a bad input
 # ---------------------------------------------------------------------------
@@ -228,6 +272,27 @@ def test_a_build_step_runs_with_ci_true(monkeypatch, tmp_path):
     # mode just because it happens to share the same _run() call.
     restart_calls = [env for argv, env in seen if argv == list(apps.STAGING_APPS["cms"].restart)]
     assert restart_calls == [None]
+
+
+def test_cms_deploy_pushes_extensions_via_shopify_cli():
+    """The cms build tuple's first two steps only ever touch the Admin SPA and
+    the headless CDN bundle — never what a Liquid storefront or a
+    Shopify-hosted extension (checkout, theme-app-extension) actually serves.
+    Without this step, storefront-verify screenshots the OLD bundle forever,
+    no matter what the worktree's diff says. Pinned as its own test because a
+    silent revert here would fail quietly: every other build step still
+    succeeds, health check still passes, deploy still reports ok=True.
+    """
+    build_argvs = [list(argv) for argv in apps.STAGING_APPS["cms"].build]
+    deploy_argv = next(
+        (argv for argv in build_argvs if argv[:3] == ["npx", "shopify", "app"]), None
+    )
+    assert deploy_argv is not None, "cms.build has no shopify app deploy step"
+    assert deploy_argv[3] == "deploy"
+    # --force is deprecated by the CLI in favour of --allow-updates; a
+    # regression back to --force is a silent quality regression, not a crash.
+    assert "--force" not in deploy_argv
+    assert "--allow-updates" in deploy_argv
 
 
 def test_every_subprocess_call_is_argv_never_a_shell_string():

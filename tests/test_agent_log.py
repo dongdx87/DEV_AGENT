@@ -152,6 +152,51 @@ def test_the_skills_dir_also_lives_outside_every_worktree(tmp_path):
     )
 
 
+def test_the_artifacts_dir_also_lives_outside_every_worktree(tmp_path):
+    """Same reasoning as the log and the skills dir: a copy inside a worktree
+    gets swept into the merge request by `git add -A`."""
+    root = tmp_path / "worktrees"
+
+    path = agent_log.host_artifacts_dir(root, "abc123")
+
+    assert path == root / agent_log.ARTIFACTS_DIR_NAME / "abc123"
+    assert agent_log.ARTIFACTS_DIR_NAME.startswith("."), "hidden so tooling skips it"
+    assert agent_log.container_artifacts_dir("/worktrees", "abc123") == (
+        f"/worktrees/{agent_log.ARTIFACTS_DIR_NAME}/abc123"
+    )
+
+
+def test_a_run_with_no_artifacts_dir_lists_nothing(tmp_path):
+    """No staging-verify (or a run that skipped it) is the normal case, not
+    an error — there is simply no directory to list."""
+    assert agent_log.list_artifacts(tmp_path / "worktrees", "abc123") == []
+
+
+def test_list_artifacts_returns_only_whitelisted_png_names(tmp_path):
+    root = tmp_path / "worktrees"
+    directory = agent_log.host_artifacts_dir(root, "abc123")
+    directory.mkdir(parents=True)
+    (directory / "before.png").write_bytes(b"x")
+    (directory / "after.png").write_bytes(b"x")
+    # Must never be served: wrong extension, path traversal, a subdirectory.
+    (directory / "notes.txt").write_text("x", encoding="utf-8")
+    (directory / "..evil.png").write_bytes(b"x")
+    (directory / "sub").mkdir()
+
+    names = agent_log.list_artifacts(root, "abc123")
+
+    assert names == ["after.png", "before.png"]
+
+
+def test_artifact_name_rejects_path_traversal_and_bad_extensions():
+    assert agent_log.ARTIFACT_NAME.match("shot.png")
+    assert not agent_log.ARTIFACT_NAME.match("../shot.png")
+    assert not agent_log.ARTIFACT_NAME.match("shot.png/../../etc/passwd")
+    assert not agent_log.ARTIFACT_NAME.match("shot.PNG")
+    assert not agent_log.ARTIFACT_NAME.match("shot.svg")
+    assert not agent_log.ARTIFACT_NAME.match("")
+
+
 def test_progress_counts_what_the_dashboard_shows(tmp_path):
     path = _write(
         tmp_path,

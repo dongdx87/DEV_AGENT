@@ -158,6 +158,134 @@ def test_a_skill_packs_root_is_required_only_when_given(config, tmp_path):
     assert str(packs_root) in step.detail
 
 
+def test_the_shopify_auth_dir_is_required_only_when_given(config, tmp_path):
+    """A ticket touching cms activates staging-verify with no marker and no
+    approval step — so this path missing from the allowlist is a silent
+    failure waiting to happen, and must be flaggable the same way skill packs
+    and the monorepo mirror already are.
+    """
+    monorepo, worktree_root = tmp_path / "BLOY", tmp_path / "wt"
+    auth_dir = tmp_path / "shopify-auth"
+    setup_wizard.write_sandbox_config(
+        [str(monorepo), str(worktree_root), str(Path.home() / ".nvm"), str(Path.home() / ".claude")]
+    )
+
+    without_it = setup_wizard.diagnose(
+        monorepo=monorepo, worktree_root=worktree_root,
+        repos=("shopify-app-loyalty-api",), twenty_url="", twenty_key="",
+    )
+    step = next(s for s in without_it if s.key == "sandbox_config")
+    assert step.state == setup_wizard.OK
+
+    with_it = setup_wizard.diagnose(
+        monorepo=monorepo, worktree_root=worktree_root,
+        repos=("shopify-app-loyalty-api",), twenty_url="", twenty_key="",
+        shopify_auth_dir=auth_dir,
+    )
+    step = next(s for s in with_it if s.key == "sandbox_config")
+    assert step.state == setup_wizard.FAIL
+    assert str(auth_dir) in step.detail
+
+
+def test_the_agent_repos_mirror_is_required_only_when_given(config, tmp_path):
+    """sandbox_runner mounts this mirror at its own absolute host path so a
+    worktree's ``.git`` pointer resolves inside the container — missing from
+    the allowlist meant opensandbox-server silently refused that mount, and a
+    real run only discovered it because git failed outright from inside.
+    """
+    monorepo, worktree_root = tmp_path / "BLOY", tmp_path / "wt"
+    mirror = tmp_path / "bloy-dev-agent-repos"
+    setup_wizard.write_sandbox_config(
+        [str(monorepo), str(worktree_root), str(Path.home() / ".nvm"), str(Path.home() / ".claude")]
+    )
+
+    without_it = setup_wizard.diagnose(
+        monorepo=monorepo, worktree_root=worktree_root,
+        repos=("shopify-app-loyalty-api",), twenty_url="", twenty_key="",
+    )
+    step = next(s for s in without_it if s.key == "sandbox_config")
+    assert step.state == setup_wizard.OK
+
+    with_it = setup_wizard.diagnose(
+        monorepo=monorepo, worktree_root=worktree_root,
+        repos=("shopify-app-loyalty-api",), twenty_url="", twenty_key="",
+        agent_repos_root=mirror,
+    )
+    step = next(s for s in with_it if s.key == "sandbox_config")
+    assert step.state == setup_wizard.FAIL
+    assert str(mirror) in step.detail
+
+
+# ---------------------------------------------------------------------------
+# The agent's own independent repo mirror — never the developer's checkout
+# ---------------------------------------------------------------------------
+
+
+def test_a_missing_mirror_directory_is_reported_fixable(tmp_path):
+    step = setup_wizard.check_agent_repos_mirror(
+        tmp_path / "does-not-exist", ("shopify-app-loyalty-api",)
+    )
+
+    assert step.state == setup_wizard.FAIL
+    assert step.fix == "clone_agent_repos_mirror"
+
+
+def test_a_mirror_missing_one_repo_names_it(tmp_path):
+    mirror = tmp_path / "mirror"
+    (mirror / "shopify-app-loyalty-api" / ".git").mkdir(parents=True)
+
+    step = setup_wizard.check_agent_repos_mirror(
+        mirror, ("shopify-app-loyalty-api", "shopify-app-loyalty-cms")
+    )
+
+    assert step.state == setup_wizard.FAIL
+    assert "shopify-app-loyalty-cms" in step.detail
+    assert "shopify-app-loyalty-api" not in step.detail
+
+
+def test_a_fully_provisioned_mirror_passes(tmp_path):
+    mirror = tmp_path / "mirror"
+    for name in ("shopify-app-loyalty-api", "shopify-app-loyalty-cms"):
+        (mirror / name / ".git").mkdir(parents=True)
+
+    step = setup_wizard.check_agent_repos_mirror(
+        mirror, ("shopify-app-loyalty-api", "shopify-app-loyalty-cms")
+    )
+
+    assert step.state == setup_wizard.OK
+
+
+def test_clone_agent_repos_mirror_is_registered_as_a_fix():
+    assert "clone_agent_repos_mirror" in setup_wizard.FIXES
+
+
+def test_clone_agent_repos_mirror_reuses_clone_repos():
+    """Same clone-into-a-name-per-repo shape as the personal-checkout fix —
+    no separate clone loop to keep in sync."""
+    assert setup_wizard.clone_agent_repos_mirror is setup_wizard.clone_repos
+
+
+def test_diagnose_skips_the_mirror_check_when_not_given(tmp_path):
+    """Callers that don't pass agent_repos_root (none currently do, but the
+    parameter is optional) must not get a step for a path they never named."""
+    steps = setup_wizard.diagnose(
+        monorepo=tmp_path / "BLOY", worktree_root=tmp_path / "wt",
+        repos=("shopify-app-loyalty-api",), twenty_url="", twenty_key="",
+    )
+
+    assert not any(s.key == "agent_repos_mirror" for s in steps)
+
+
+def test_diagnose_includes_the_mirror_check_when_given(tmp_path):
+    steps = setup_wizard.diagnose(
+        monorepo=tmp_path / "BLOY", worktree_root=tmp_path / "wt",
+        repos=("shopify-app-loyalty-api",), twenty_url="", twenty_key="",
+        agent_repos_root=tmp_path / "mirror",
+    )
+
+    assert any(s.key == "agent_repos_mirror" for s in steps)
+
+
 # ---------------------------------------------------------------------------
 # Egress mode (dns -> dns+nft)
 # ---------------------------------------------------------------------------

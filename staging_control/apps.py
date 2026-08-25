@@ -54,6 +54,20 @@ STAGING_APPS: dict[str, StagingApp] = {
         build=(
             ("npm", "run", "build", "--prefix", "web/frontend"),
             ("pnpm", "--filter", "bloy-extensions", "run", "build-bloy"),
+            # Pushes theme-app-extension/checkout/admin extensions to the
+            # linked dev app ("Test BLOY Loyalty") so the real storefront
+            # (test-bloy-loyalty.myshopify.com) actually reflects this
+            # worktree — the two steps above only ever touched the Admin SPA
+            # and the headless CDN bundle, never what a Liquid storefront or
+            # Shopify-hosted extension serves. `--allow-updates` is the
+            # documented CI/CD flag (the older `--force` is deprecated) —
+            # both skip the interactive confirmation prompt, but neither
+            # supplies credentials: this still needs a Shopify CLI session
+            # already authenticated (via `npx shopify auth login`, run once
+            # by hand from this checkout) against the Partner org that owns
+            # this app's client_id, or deploy fails with a 403 instead of
+            # prompting for login.
+            ("npx", "shopify", "app", "deploy", "--allow-updates", "--no-color"),
         ),
         restart=("pm2", "restart", "bloy-stg-cms"),
         health_check=("http", "http://localhost:3012/life-check"),
@@ -115,4 +129,17 @@ RSYNC_EXCLUDES = (
     # crashed `shopify app deploy`'s theme-app-extension build outright
     # (`ENOENT: scandir .../theme-app-extension/locales`), not just warned.
     "extensions/theme-app-extension/locales",
+    # Fifth instance of the same "checkout-local, not in git" bug class —
+    # gitignored by the repo itself (`extensions/*/*.toml`, only the
+    # `.example` template is tracked) because each extension's UUID is
+    # per-app, written back into this file by a *successful* `shopify app
+    # deploy`. Found live: every earlier `cms` deploy (before this app had
+    # its own `shopify app deploy` step) silently wiped whatever real files
+    # a prior manual deploy had created, since a plain worktree never has
+    # them either — by the time this app's own deploy step first ran, the
+    # checkout had none left, so the CLI saw "0 extensions locally" against
+    # an app that already had real ones live, and proposed deleting all of
+    # them. Excluding the glob stops any future deploy from erasing the
+    # config again once it exists.
+    "extensions/*/*.toml",
 )

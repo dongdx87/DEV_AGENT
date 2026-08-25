@@ -31,6 +31,32 @@ def default_worktree_root() -> Path:
     """
     return Path(os.environ.get("BLOY_WORKTREE_ROOT", "/home/bss-group/bloy-worktrees"))
 
+
+def default_agent_repos_root() -> Path:
+    """Where the agent's own independent clones live — never the developer's
+    personal checkout.
+
+    Without this, ``prepare()`` ran ``git fetch``/``git worktree add`` *inside
+    the developer's own working copy* (``monorepo/repo``), because that
+    checkout was the only clone on the machine. That is a real coupling, not
+    just a theoretical one: it shares the same ``.git`` object store and
+    remote-tracking refs as whatever the developer is doing by hand at that
+    moment, and an unattended run's fetch mutates that checkout's own
+    `origin/<base>` ref as a side effect. A developer's local branch state,
+    an in-progress rebase, or simply having the wrong branch checked out at
+    the wrong moment has nothing to do with what an automated ticket should
+    branch from.
+
+    ``prepare()`` prefers a repo cloned here over ``monorepo/repo`` whenever
+    both exist, and falls back to the old behaviour only when this mirror
+    has not been provisioned yet (see ``setup_wizard.check_agent_repos_mirror``
+    for the one-time clone). Overridable via ``BLOY_AGENT_REPOS_ROOT``.
+    """
+    return Path(
+        os.environ.get("BLOY_AGENT_REPOS_ROOT", str(Path.home() / "bloy-dev-agent-repos"))
+    )
+
+
 #: Sub-projects the agent may work in, relative to the monorepo directory.
 KNOWN_REPOS = (
     "shopify-app-loyalty-api",
@@ -127,7 +153,14 @@ def prepare(
     if repo not in KNOWN_REPOS:
         raise WorkspaceError(f"Unknown repo {repo!r}; expected one of {KNOWN_REPOS}")
 
-    source = monorepo / repo
+    # Prefer the agent's own independent clone — see default_agent_repos_root's
+    # docstring for why sharing the developer's own checkout was a real
+    # coupling, not just a theoretical one. Falling back to the personal
+    # checkout only when the mirror has not been provisioned yet keeps this
+    # backward compatible rather than breaking every run on hosts that
+    # haven't set it up.
+    mirror_source = default_agent_repos_root() / repo
+    source = mirror_source if (mirror_source / ".git").exists() else monorepo / repo
     if not (source / ".git").exists():
         raise WorkspaceError(f"{source} is not a git repository")
 
@@ -199,8 +232,22 @@ LOCKFILES = frozenset(
 )
 
 
-def discard_lockfile_changes(workspace: Workspace) -> list[str]:
-    """Undo any lockfile the run touched; return the paths reverted.
+#: Directories a run must never bring into a merge request either, for the
+#: exact same reason as LOCKFILES: they are build output, not source, and an
+#: agent legitimately runs the build while investigating (checking a
+#: constraint, comparing before/after) without meaning to commit the result.
+#: Found live: an agent investigating a checkout-extension build limit ran
+#: `node build-cdn.js`, and the resulting minify/format diff — thousands of
+#: lines across all 9 bundles, including a ~40k-line truncation of
+#: `headless.bloy.js` — rode into a real merge request under an unrelated
+#: ticket that had touched no source at all. staging_control/apps.py's
+#: RSYNC_EXCLUDES already treats this exact path as checkout-local, never
+#: authoritative from a worktree, for the same reason.
+GENERATED_DIRS = ("extensions/cdn-dist",)
+
+
+def discard_generated_changes(workspace: Workspace) -> list[str]:
+    """Undo any lockfile or generated-output-dir change; return the paths reverted.
 
     Enforced here rather than only asked for in the prompt: an instruction is a
     request, and this is the single place where anything gets staged, so it is
@@ -216,7 +263,11 @@ def discard_lockfile_changes(workspace: Workspace) -> list[str]:
         # Renames read "old -> new"; the destination is what is staged.
         if " -> " in path:
             path = path.split(" -> ", 1)[1]
-        if Path(path).name not in LOCKFILES:
+        is_lockfile = Path(path).name in LOCKFILES
+        is_generated = any(
+            path == d or path.startswith(f"{d}/") for d in GENERATED_DIRS
+        )
+        if not is_lockfile and not is_generated:
             continue
 
         if code.strip() == "??":
@@ -227,7 +278,7 @@ def discard_lockfile_changes(workspace: Workspace) -> list[str]:
 
     if reverted:
         logger.info(
-            "bloy_dev_agent: bỏ thay đổi lockfile khỏi %s: %s",
+            "bloy_dev_agent: bỏ thay đổi lockfile/generated khỏi %s: %s",
             workspace.issue_key,
             ", ".join(reverted),
         )

@@ -24,8 +24,8 @@ from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 
-from fastapi import BackgroundTasks, FastAPI, Form, Request
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi import BackgroundTasks, FastAPI, Form, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 from bloy_dev_agent import preflight, setup_wizard, store
@@ -38,6 +38,7 @@ from bloy_dev_agent.features import (
     workspace,
 )
 from bloy_dev_agent.models import BloyPipelineRun
+from bloy_dev_agent.staging_control import tokens as staging_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -174,6 +175,18 @@ def _reap_on_boot() -> None:
             )
     except Exception:  # noqa: BLE001 — boot must not fail on the sweep
         logger.exception("bloy_dev_agent: orphan sandbox sweep failed")
+
+    # Same reasoning as the run/sandbox reap above: only this process ever
+    # runs a pass, so any staging token still unrevoked at boot belongs to a
+    # run a killed process never finished.
+    try:
+        revoked = staging_tokens.revoke_all_active()
+        if revoked:
+            logger.warning(
+                "bloy_dev_agent: đã revoke %d staging token còn sống từ trước", revoked
+            )
+    except Exception:  # noqa: BLE001 — boot must not fail on this sweep either
+        logger.exception("bloy_dev_agent: staging token reap failed")
 
     saved = store.get_settings()
     project_id = saved.get(store.SETTING_PROJECT_ID) or ""
@@ -413,6 +426,7 @@ def create_app() -> FastAPI:
         if run is None:
             return RedirectResponse(url="/", status_code=303)
         events = agent_log.parse(Path(run.log_path)) if run.log_path else []
+        artifacts = agent_log.list_artifacts(workspace.default_worktree_root(), run_id)
         return TEMPLATES.TemplateResponse(
             request=request,
             name="bloy_run.html",
@@ -422,8 +436,27 @@ def create_app() -> FastAPI:
                 run=_run_view(run),
                 events=[asdict(e) for e in events],
                 live=run.state == BloyPipelineRun.STATE_RUNNING,
+                artifacts=artifacts,
             ),
         )
+
+    @app.get("/runs/{run_id}/artifacts/{filename}")
+    def run_artifact(run_id: str, filename: str):
+        """One staging-verify screenshot, or a 404 — never a raw path join.
+
+        The filename is checked against the whitelist BEFORE it ever reaches a
+        path, matching the discipline elsewhere in this codebase (see
+        staging_control/apps.py's docstring): a crafted value must never reach
+        an arbitrary file, and FastAPI's own path-segment routing already
+        refuses a "/" in ``filename``, so a ".." cannot escape the directory
+        even before the regex runs.
+        """
+        if not agent_log.ARTIFACT_NAME.match(filename):
+            raise HTTPException(status_code=400, detail="tên file không hợp lệ")
+        path = agent_log.host_artifacts_dir(workspace.default_worktree_root(), run_id) / filename
+        if not path.is_file():
+            raise HTTPException(status_code=404)
+        return FileResponse(path, media_type="image/png")
 
     @app.get("/settings")
     def settings_page(request: Request):
@@ -540,6 +573,8 @@ def create_app() -> FastAPI:
                 saved.get(store.SETTING_SKILLS_ROOT) or skill_packs.DEFAULT_SKILLS_ROOT
             ),
             monorepo_mirror=sandbox_runner.DEFAULT_MONOREPO_MIRROR,
+            shopify_auth_dir=sandbox_runner.SHOPIFY_AUTH_DIR,
+            agent_repos_root=workspace.default_agent_repos_root(),
         )
         counts: dict[str, int] = {}
         for step in steps:
@@ -600,11 +635,18 @@ def create_app() -> FastAPI:
                     str(Path.home() / ".claude"),
                     saved.get(store.SETTING_SKILLS_ROOT) or str(skill_packs.DEFAULT_SKILLS_ROOT),
                     str(sandbox_runner.DEFAULT_MONOREPO_MIRROR),
+                    str(sandbox_runner.SHOPIFY_AUTH_DIR),
                 ])
             elif action == "write_egress_mode":
                 message = setup_wizard.write_egress_mode()
             elif action == "start_sandbox_server":
                 message = setup_wizard.start_sandbox_server()
+            elif action == "clone_agent_repos_mirror":
+                message = setup_wizard.clone_agent_repos_mirror(
+                    workspace.default_agent_repos_root(),
+                    workspace.KNOWN_REPOS,
+                    saved.get(store.SETTING_GIT_REMOTE) or DEFAULT_GIT_REMOTE,
+                )
             else:
                 message = setup_wizard.clone_repos(
                     monorepo,
@@ -635,6 +677,8 @@ def create_app() -> FastAPI:
                 saved.get(store.SETTING_SKILLS_ROOT) or skill_packs.DEFAULT_SKILLS_ROOT
             ),
             monorepo_mirror=sandbox_runner.DEFAULT_MONOREPO_MIRROR,
+            shopify_auth_dir=sandbox_runner.SHOPIFY_AUTH_DIR,
+            agent_repos_root=workspace.default_agent_repos_root(),
         )
         return {
             "ready": all(s.state != setup_wizard.FAIL for s in steps),

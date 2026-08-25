@@ -22,6 +22,22 @@ from bloy_dev_agent.features import pipeline, workspace
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def no_agent_repos_mirror(monkeypatch, tmp_path):
+    """Every test in this module builds its own throwaway "monorepo" fixture
+    and expects workspace.prepare() to branch from it. default_agent_repos_root()
+    is a fixed *real host path* (~/bloy-dev-agent-repos) — without this, once
+    that mirror is actually provisioned on a real machine, prepare() would
+    silently prefer it over every test's own fixture, using real repo content
+    instead of the fake one a test just built. Pointing the mirror root at an
+    empty tmp_path directory keeps every existing test's fixture the one and
+    only source, regardless of what exists on the real host.
+    """
+    monkeypatch.setattr(
+        workspace, "default_agent_repos_root", lambda: tmp_path / "no-agent-mirror-here"
+    )
+
+
 def _git(args, cwd):
     subprocess.run(
         ["git", *args], cwd=str(cwd), check=True, capture_output=True, text=True
@@ -74,6 +90,62 @@ def test_prepare_rejects_an_unknown_repo(monorepo: Path, tmp_path: Path):
     with pytest.raises(workspace.WorkspaceError):
         workspace.prepare(
             "BLOY-2", monorepo=monorepo, repo="../etc", root=tmp_path / "wt"
+        )
+
+
+def _repo(path: Path, *, readme: str) -> None:
+    path.mkdir(parents=True)
+    _git(["init", "-b", "master"], path)
+    _git(["config", "user.email", "dev@example.com"], path)
+    _git(["config", "user.name", "Dev Agent Test"], path)
+    (path / "README.md").write_text(readme, encoding="utf-8")
+    _git(["add", "-A"], path)
+    _git(["commit", "-m", "init"], path)
+
+
+def test_prepare_prefers_the_agent_owned_mirror_over_the_personal_checkout(
+    monorepo: Path, tmp_path: Path, monkeypatch
+):
+    """The whole point of the independent mirror: once it exists, an
+    unattended run must never touch (or branch from) the developer's own
+    checkout again, even though both are "valid" git repos for this name."""
+    mirror_root = tmp_path / "mirror"
+    _repo(mirror_root / "shopify-app-loyalty-api", readme="from the independent mirror\n")
+    monkeypatch.setattr(workspace, "default_agent_repos_root", lambda: mirror_root)
+
+    space = workspace.prepare(
+        "BLOY-2", monorepo=monorepo, repo="shopify-app-loyalty-api", root=tmp_path / "wt"
+    )
+
+    assert (space.path / "README.md").read_text(encoding="utf-8") == (
+        "from the independent mirror\n"
+    )
+
+
+def test_prepare_falls_back_to_the_personal_checkout_when_no_mirror_exists(
+    monorepo: Path, tmp_path: Path, monkeypatch
+):
+    """Backward compatible: a host that hasn't provisioned the mirror yet
+    must keep working exactly as before, not start failing every run."""
+    monkeypatch.setattr(
+        workspace, "default_agent_repos_root", lambda: tmp_path / "never-provisioned"
+    )
+
+    space = workspace.prepare(
+        "BLOY-2", monorepo=monorepo, repo="shopify-app-loyalty-api", root=tmp_path / "wt"
+    )
+
+    assert (space.path / "README.md").exists()
+
+
+def test_prepare_reports_the_mirror_path_when_neither_exists(tmp_path: Path, monkeypatch):
+    mirror_root = tmp_path / "no-mirror"
+    monkeypatch.setattr(workspace, "default_agent_repos_root", lambda: mirror_root)
+
+    with pytest.raises(workspace.WorkspaceError, match="not a git repository"):
+        workspace.prepare(
+            "BLOY-2", monorepo=tmp_path / "no-personal-checkout-either",
+            repo="shopify-app-loyalty-api", root=tmp_path / "wt",
         )
 
 
@@ -252,10 +324,13 @@ def test_a_failed_sandbox_never_reaches_git(monkeypatch, monorepo, tmp_path):
     assert (outcome.ok, outcome.stage) == (False, "sandbox")
 
 
-def test_comments_to_twenty_are_off_by_default(monkeypatch, monorepo, tmp_path, cap_db):
-    """Temporary: retrying-the-whole-issue used to post one comment per silent
-    auto-retry — spam. Paused via pipeline.COMMENTS_ENABLED until that's
-    confirmed fixed in production; flip it back to True to re-enable.
+def test_comments_to_twenty_are_on_by_default(monkeypatch, monorepo, tmp_path, cap_db):
+    """Retrying-the-whole-issue used to post one comment per silent auto-retry
+    — spam. Comments were paused via pipeline.COMMENTS_ENABLED until that was
+    fixed (separating error_status from source_status, plus the in-place
+    sandbox-stage retry that reuses one run_id) and confirmed clean across
+    real passes. Comments are back on by default; this pins exactly one
+    comment per run, not zero and not more.
     """
     ok = pipeline.sandbox_runner.SandboxResult(True, "đã sửa", "sb-1", 0)
     monkeypatch.setattr(pipeline.sandbox_runner, "run_in_sandbox", lambda *a, **k: ok)
@@ -277,7 +352,89 @@ def test_comments_to_twenty_are_off_by_default(monkeypatch, monorepo, tmp_path, 
         statuses=STATUSES,
     )
 
-    assert client.comments == []
+    assert len(client.comments) == 1
+
+
+class _FakeTwentyWithFiles:
+    """FakeTwenty plus the file-upload surface `_attach_screenshots` needs."""
+
+    def __init__(self, *, field_id="field-1", upload_error=None):
+        self.attachments: list[dict] = []
+        self.uploaded: list[tuple[bytes, str]] = []
+        self._field_id = field_id
+        self._upload_error = upload_error
+
+    def attachment_file_field_id(self):
+        return self._field_id
+
+    def upload_file(self, content, filename, field_metadata_id):
+        if self._upload_error is not None:
+            raise self._upload_error
+        self.uploaded.append((content, filename))
+        return {"id": f"file-for-{filename}"}
+
+    def create_record(self, obj, payload):
+        if obj == "attachments":
+            self.attachments.append(payload)
+        return {"id": "created-1"}
+
+
+def test_attach_screenshots_uploads_every_saved_artifact(tmp_path):
+    from bloy_dev_agent.features import agent_log
+
+    run_id = "run-abc"
+    directory = agent_log.host_artifacts_dir(tmp_path, run_id)
+    directory.mkdir(parents=True)
+    (directory / "before.png").write_bytes(b"before-bytes")
+    (directory / "after.png").write_bytes(b"after-bytes")
+
+    client = _FakeTwentyWithFiles()
+    pipeline._attach_screenshots(client, "issue-1", "comment-1", tmp_path, run_id)
+
+    assert sorted(name for _, name in client.uploaded) == ["after.png", "before.png"]
+    assert len(client.attachments) == 2
+    for payload in client.attachments:
+        assert payload["targetIssueId"] == "issue-1"
+        assert payload["targetIssueCommentId"] == "comment-1"
+        assert payload["file"][0]["fileId"].startswith("file-for-")
+
+
+def test_attach_screenshots_does_nothing_when_none_were_saved(tmp_path):
+    client = _FakeTwentyWithFiles()
+    pipeline._attach_screenshots(client, "issue-1", "comment-1", tmp_path, "run-empty")
+    assert client.uploaded == []
+    assert client.attachments == []
+
+
+def test_attach_screenshots_never_raises_on_a_transient_upload_failure(tmp_path):
+    from bloy_dev_agent.features import agent_log
+    from bloy_dev_agent.features.twenty.client import TwentyError
+
+    run_id = "run-flaky"
+    directory = agent_log.host_artifacts_dir(tmp_path, run_id)
+    directory.mkdir(parents=True)
+    (directory / "shot.png").write_bytes(b"bytes")
+
+    client = _FakeTwentyWithFiles(upload_error=TwentyError("boom"))
+    # Must not raise — a screenshot-upload hiccup must never fail an
+    # otherwise-successful run that already has a real merge request.
+    pipeline._attach_screenshots(client, "issue-1", "comment-1", tmp_path, run_id)
+    assert client.attachments == []
+
+
+def test_attach_screenshots_omits_comment_id_when_no_comment_was_posted(tmp_path):
+    from bloy_dev_agent.features import agent_log
+
+    run_id = "run-nocomment"
+    directory = agent_log.host_artifacts_dir(tmp_path, run_id)
+    directory.mkdir(parents=True)
+    (directory / "shot.png").write_bytes(b"bytes")
+
+    client = _FakeTwentyWithFiles()
+    pipeline._attach_screenshots(client, "issue-1", "", tmp_path, run_id)
+
+    assert len(client.attachments) == 1
+    assert "targetIssueCommentId" not in client.attachments[0]
 
 
 def test_a_transient_sandbox_failure_is_retried_within_the_same_run(
@@ -360,17 +517,26 @@ def cap_db(monkeypatch, tmp_path):
     this the suite writes rows straight into the running instance's database —
     which it did, and those rows then counted as real failed attempts against
     real issues.
+
+    Also binds ``staging_control.tokens`` to the same throwaway engine:
+    ``_finish`` now unconditionally calls ``staging_tokens.revoke`` on every
+    outcome, and that module imported its own ``SessionLocal`` independently —
+    patching ``store.SessionLocal`` alone would leave it pointed at the real
+    database.
     """
     from sqlalchemy import create_engine
     from sqlalchemy.orm import sessionmaker
 
     from bloy_dev_agent import store
-    from bloy_dev_agent.models import BloyPipelineRun, BloySetting
+    from bloy_dev_agent.models import BloyPipelineRun, BloySetting, BloyStagingToken
+    from bloy_dev_agent.staging_control import tokens as staging_tokens
 
     engine = create_engine(f"sqlite:///{tmp_path / 'cap.sqlite3'}")
-    for model in (BloyPipelineRun, BloySetting):
+    for model in (BloyPipelineRun, BloySetting, BloyStagingToken):
         model.__table__.create(engine, checkfirst=True)
-    monkeypatch.setattr(store, "SessionLocal", sessionmaker(bind=engine))
+    session_local = sessionmaker(bind=engine)
+    monkeypatch.setattr(store, "SessionLocal", session_local)
+    monkeypatch.setattr(staging_tokens, "SessionLocal", session_local)
     return store
 
 
@@ -656,19 +822,21 @@ def test_the_sweep_leaves_a_live_run_alone():
 
 
 # ---------------------------------------------------------------------------
-# Advice mode: the answer is the deliverable, not a merge request
+# Snippet deliverable: the agent's own call, no ticket marker involved
 # ---------------------------------------------------------------------------
 
 
-ADVICE_ISSUE = {
+SNIPPET_ISSUE = {
     "id": "issue-adv",
     "issueKey": "BLOY-9",
     "title": "BLS-1077: bỏ viền card VIP tier, căn giữa",
-    "description": "Deliverable: snippet\nKhách muốn bỏ line quanh text và căn giữa.",
+    "description": "Khách muốn bỏ line quanh text và căn giữa.",
 }
 
 
-def _advice_run(monkeypatch, monorepo, tmp_path, *, output):
+def _snippet_run(monkeypatch, monorepo, tmp_path, *, output):
+    """Runs with the sandbox always granted write access (implement=True) —
+    the agent, not a ticket marker, decides whether to use it."""
     client = FakeTwenty()
     monkeypatch.setattr(pipeline, "COMMENTS_ENABLED", True)
     seen = {}
@@ -682,11 +850,11 @@ def _advice_run(monkeypatch, monorepo, tmp_path, *, output):
     monkeypatch.setattr(
         pipeline.workspace,
         "commit_and_push",
-        lambda *a, **k: pytest.fail("advice mode must never push or open an MR"),
+        lambda *a, **k: pytest.fail("a snippet deliverable must never push or open an MR"),
     )
     outcome = pipeline.run_issue(
         client,
-        ADVICE_ISSUE,
+        SNIPPET_ISSUE,
         monorepo=monorepo,
         target_repo="shopify-app-loyalty-api",
         worktree_root=tmp_path / "wt",
@@ -696,25 +864,35 @@ def _advice_run(monkeypatch, monorepo, tmp_path, *, output):
 
 
 def test_a_snippet_task_succeeds_without_changing_any_file(monkeypatch, monorepo, tmp_path):
-    """Editing the app's CSS would restyle every merchant, so no diff is correct.
+    """Editing the app's CSS would restyle every merchant, so no diff is correct
+    once the agent itself decides a theme-level snippet is enough and says so
+    under the required heading.
 
-    Before this mode existed the pipeline scored such a run as `no-change` →
-    failed, which punished the agent for doing the right thing.
+    Without that heading the pipeline would score this `no-change` → failed,
+    which punished the agent for doing the right thing — that's exactly the
+    regression `test_a_run_that_changed_nothing_is_not_a_success` guards for
+    the OTHER case (no heading, genuinely gave up).
     """
-    answer = "```css\n.bloy-page__card { border: none; text-align: center; }\n```"
+    answer = (
+        "```css\n.bloy-page__card { border: none; text-align: center; }\n```\n\n"
+        "DELIVERABLE: SNIPPET"
+    )
 
-    client, outcome, _ = _advice_run(monkeypatch, monorepo, tmp_path, output=answer)
+    client, outcome, seen = _snippet_run(monkeypatch, monorepo, tmp_path, output=answer)
 
     assert (outcome.ok, outcome.stage) == (True, "done")
     assert outcome.advice is True
     assert outcome.merge_request_url == ""
     assert outcome.moved_to == "In Review"
+    # The sandbox always has write access now — nothing pre-decides otherwise;
+    # the agent chose not to write anything, it was never physically unable to.
+    assert seen["implement"] is True
 
 
 def test_the_snippet_reaches_the_reviewer_in_the_comment(monkeypatch, monorepo, tmp_path):
-    answer = "```css\n.bloy-page__card { border: none; }\n```"
+    answer = "```css\n.bloy-page__card { border: none; }\n```\n\nDELIVERABLE: SNIPPET"
 
-    client, _, _ = _advice_run(monkeypatch, monorepo, tmp_path, output=answer)
+    client, _, _ = _snippet_run(monkeypatch, monorepo, tmp_path, output=answer)
 
     # The stored payload is blocknote JSON, which escapes non-ASCII; decode it
     # rather than asserting against the escaped form.
@@ -725,28 +903,62 @@ def test_the_snippet_reaches_the_reviewer_in_the_comment(monkeypatch, monorepo, 
     assert "dán vào theme khách" in posted
 
 
-def test_advice_mode_runs_the_agent_read_only(monkeypatch, monorepo, tmp_path):
-    """It must not be able to edit the repo even by accident."""
-    _, _, seen = _advice_run(monkeypatch, monorepo, tmp_path, output="x" * 50)
-
-    assert seen["implement"] is False
-    assert "Do NOT edit any file" in seen["prompt"]
-
-
 def test_an_empty_answer_is_still_a_failure(monkeypatch, monorepo, tmp_path):
-    """No diff AND no answer means the run produced nothing at all."""
-    _, outcome, _ = _advice_run(monkeypatch, monorepo, tmp_path, output="   ")
+    """No diff AND no heading means the run produced nothing usable at all —
+    the agent never declared a snippet, so this stays the ordinary no-change
+    failure, not success-by-default."""
+    _, outcome, _ = _snippet_run(monkeypatch, monorepo, tmp_path, output="   ")
 
     assert outcome.ok is False
 
 
+def test_a_ticket_already_solvable_by_an_existing_feature_is_not_a_failure(
+    monkeypatch, monorepo, tmp_path
+):
+    """Found live: a ticket can need NEITHER a code change NOR a snippet,
+    because the ask is already achievable with an existing Admin feature.
+    That correct, valuable answer must not be scored as a no-change failure."""
+    answer = (
+        "Đã xác nhận qua code: Admin đã có sẵn field này cho mọi shop, không cần "
+        "thêm gì.\n\nDELIVERABLE: NO CHANGE NEEDED"
+    )
+
+    _, outcome, _ = _snippet_run(monkeypatch, monorepo, tmp_path, output=answer)
+
+    assert (outcome.ok, outcome.stage) == (True, "done")
+    assert outcome.advice is True
+    assert outcome.merge_request_url == ""
+
+
 def test_a_normal_ticket_is_unaffected(monkeypatch, monorepo, tmp_path):
-    """Only the marker switches modes; everything else still opens an MR."""
+    """A ticket the agent implements for real (no snippet heading in its
+    answer) still opens an MR exactly as before."""
     ok = pipeline.sandbox_runner.SandboxResult(True, "đã sửa", "sb-1", 0)
 
     _, outcome = _run(monkeypatch, monorepo, tmp_path, sandbox_result=ok, changed=True)
 
     assert (outcome.advice, outcome.merge_request_url) == (False, "https://gitlab/mr/9")
+
+
+def test_a_real_diff_that_also_declares_the_snippet_heading_gets_flagged(
+    monkeypatch, monorepo, tmp_path
+):
+    """A real diff shipped AND the agent claimed DELIVERABLE: SNIPPET is a
+    contradiction — it must not sit as inert prose in an otherwise ordinary
+    "opened a merge request" comment. The MR still ships (a real diff is
+    real), but the reviewer must see a loud warning, not silence."""
+    result = pipeline.sandbox_runner.SandboxResult(
+        True, "đã sửa\n\nDELIVERABLE: SNIPPET", "sb-1", 0
+    )
+
+    client, outcome = _run(monkeypatch, monorepo, tmp_path, sandbox_result=result, changed=True)
+
+    assert outcome.ok is True
+    assert outcome.merge_request_url == "https://gitlab/mr/9"
+    from bloy_dev_agent.features.twenty import mapping
+
+    posted = mapping.blocknote_to_text(ast.literal_eval(client.comments[0])["bodyV2"])
+    assert "mâu thuẫn" in posted
 
 
 # ---------------------------------------------------------------------------
@@ -767,7 +979,7 @@ def test_a_modified_lockfile_is_reverted(monorepo: Path, tmp_path: Path):
     (space.path / "package-lock.json").write_text('{"v":2, "churn":true}\n', encoding="utf-8")
     (space.path / "real.ts").write_text("export const fix = 1\n", encoding="utf-8")
 
-    reverted = workspace.discard_lockfile_changes(space)
+    reverted = workspace.discard_generated_changes(space)
 
     assert reverted == ["package-lock.json"]
     assert (space.path / "package-lock.json").read_text() == '{"v":1}\n'
@@ -782,7 +994,7 @@ def test_an_untracked_lockfile_is_deleted(monorepo: Path, tmp_path: Path):
     )
     (space.path / "yarn.lock").write_text("# generated\n", encoding="utf-8")
 
-    reverted = workspace.discard_lockfile_changes(space)
+    reverted = workspace.discard_generated_changes(space)
 
     assert reverted == ["yarn.lock"]
     assert not (space.path / "yarn.lock").exists()
@@ -798,9 +1010,63 @@ def test_a_lockfile_in_a_subdirectory_is_caught(monorepo: Path, tmp_path: Path):
     nested.mkdir(parents=True)
     (nested / "pnpm-lock.yaml").write_text("lockfileVersion: 6\n", encoding="utf-8")
 
-    reverted = workspace.discard_lockfile_changes(space)
+    reverted = workspace.discard_generated_changes(space)
 
     assert reverted == ["extensions/core/pnpm-lock.yaml"]
+
+
+def test_a_rebuilt_cdn_dist_bundle_is_reverted(two_repo_monorepo: Path, tmp_path: Path):
+    """Live bug: investigating a checkout-extension build constraint ran
+    `node build-cdn.js`, and the resulting ~40k-line minify/format diff across
+    every cdn-dist bundle rode into a real merge request under a ticket that
+    never touched source at all."""
+    space = workspace.prepare(
+        "BLS-9016", monorepo=two_repo_monorepo, repo="shopify-app-loyalty-cms",
+        root=tmp_path / "wt",
+    )
+    generated = space.path / "extensions" / "cdn-dist"
+    generated.mkdir(parents=True, exist_ok=True)
+    (generated / "popup.bloy.js").write_text("export const rebuilt = true\n", encoding="utf-8")
+    (space.path / "extensions" / "core" / "helpers").mkdir(parents=True, exist_ok=True)
+    (space.path / "extensions" / "core" / "helpers" / "real.js").write_text(
+        "export const fix = 1\n", encoding="utf-8"
+    )
+
+    reverted = workspace.discard_generated_changes(space)
+
+    assert reverted == ["extensions/cdn-dist/popup.bloy.js"]
+    assert not (generated / "popup.bloy.js").exists()
+    assert (space.path / "extensions" / "core" / "helpers" / "real.js").exists()
+    assert workspace.has_changes(space) is True
+
+
+def test_a_modified_tracked_file_under_a_generated_dir_is_restored(
+    two_repo_monorepo: Path, tmp_path: Path
+):
+    """Not just new files — an already-tracked bundle rebuilt in place must
+    revert to its committed content too, the same as a modified lockfile."""
+    repo = two_repo_monorepo / "shopify-app-loyalty-cms"
+    (repo / "extensions" / "cdn-dist").mkdir(parents=True, exist_ok=True)
+    (repo / "extensions" / "cdn-dist" / "popup.bloy.js").write_text(
+        "export const original = true\n", encoding="utf-8"
+    )
+    _git(["add", "-A"], repo)
+    _git(["commit", "-m", "seed committed bundle"], repo)
+
+    space = workspace.prepare(
+        "BLS-9017", monorepo=two_repo_monorepo, repo="shopify-app-loyalty-cms",
+        root=tmp_path / "wt",
+    )
+    (space.path / "extensions" / "cdn-dist" / "popup.bloy.js").write_text(
+        "export const rebuilt = true\n", encoding="utf-8"
+    )
+
+    reverted = workspace.discard_generated_changes(space)
+
+    assert reverted == ["extensions/cdn-dist/popup.bloy.js"]
+    assert (
+        space.path / "extensions" / "cdn-dist" / "popup.bloy.js"
+    ).read_text() == "export const original = true\n"
 
 
 def test_files_that_merely_look_like_lockfiles_are_kept():
@@ -816,7 +1082,7 @@ def test_a_run_whose_only_output_was_a_lockfile_is_not_a_success(
     ok = pipeline.sandbox_runner.SandboxResult(True, "đã chạy npm install", "sb", 0)
     monkeypatch.setattr(pipeline.sandbox_runner, "run_in_sandbox", lambda *a, **k: ok)
     monkeypatch.setattr(
-        pipeline.workspace, "discard_lockfile_changes", lambda s: ["package-lock.json"]
+        pipeline.workspace, "discard_generated_changes", lambda s: ["package-lock.json"]
     )
     monkeypatch.setattr(pipeline.workspace, "has_changes", lambda s: False)
     monkeypatch.setattr(
@@ -1033,7 +1299,7 @@ def _multi_run(monkeypatch, root, tmp_path, *, changed_repos, push_fails=()):
         pipeline.workspace, "has_changes", lambda s: s.repo in changed_repos
     )
     monkeypatch.setattr(pipeline.workspace, "diffstat", lambda s: f" {s.repo} | 1 +")
-    monkeypatch.setattr(pipeline.workspace, "discard_lockfile_changes", lambda s: [])
+    monkeypatch.setattr(pipeline.workspace, "discard_generated_changes", lambda s: [])
 
     def fake_push(space, **kw):
         if space.repo in push_fails:
@@ -1120,6 +1386,132 @@ def test_a_single_repo_ticket_is_unchanged(monkeypatch, monorepo, tmp_path):
 
     assert outcome.ok is True
     assert outcome.merge_request_url == "https://gitlab/mr/9"
+
+
+# ---------------------------------------------------------------------------
+# Staging-verify wiring: activation, concurrency, token mint/revoke
+# ---------------------------------------------------------------------------
+
+
+def _staging_run(monkeypatch, root, tmp_path, *, sandbox_ok=True):
+    """Like _multi_run, but captures every kwarg sandbox_runner.run_in_sandbox
+    actually received — this is what pins staging=/staging_token= wiring."""
+    client = FakeTwenty()
+    monkeypatch.setattr(pipeline, "COMMENTS_ENABLED", True)
+    seen: dict = {}
+
+    def fake_sandbox(prompt, worktree, **kwargs):
+        seen["prompt"] = prompt
+        seen.update(kwargs)
+        return pipeline.sandbox_runner.SandboxResult(sandbox_ok, "đã sửa cả hai", "sb", 0)
+
+    monkeypatch.setattr(pipeline.sandbox_runner, "run_in_sandbox", fake_sandbox)
+    monkeypatch.setattr(pipeline.workspace, "has_changes", lambda s: True)
+    monkeypatch.setattr(pipeline.workspace, "diffstat", lambda s: f" {s.repo} | 1 +")
+    monkeypatch.setattr(pipeline.workspace, "discard_generated_changes", lambda s: [])
+    monkeypatch.setattr(
+        pipeline.workspace,
+        "commit_and_push",
+        lambda space, **kw: {"ok": True, "merge_request_url": f"https://gitlab/{space.repo}/mr/1"},
+    )
+
+    outcome = pipeline.run_issue(
+        client, MULTI_ISSUE,
+        monorepo=root, target_repo="shopify-app-loyalty-api",
+        worktree_root=tmp_path / "wt", statuses=STATUSES,
+    )
+    return client, outcome, seen
+
+
+def test_a_ticket_touching_cms_gets_a_staging_token_and_context(
+    monkeypatch, two_repo_monorepo, tmp_path, cap_db
+):
+    """MULTI_ISSUE names both repos, cms among them — this must be enough to
+    activate staging-verify with no marker anywhere in the ticket body."""
+    _, outcome, seen = _staging_run(monkeypatch, two_repo_monorepo, tmp_path)
+
+    assert seen["staging"] is True
+    assert seen["staging_token"], "a real token must be minted, not left blank"
+    assert "## Staging verify" in seen["prompt"]
+    assert "## Storefront verify" in seen["prompt"], (
+        "the real pipeline wiring must reach mapping.StagingContext's new "
+        "storefront fields, not just the mapping.py-level append logic"
+    )
+    assert outcome.ok is True
+
+
+def test_the_storefront_url_and_password_come_from_the_configured_defaults(
+    monkeypatch, two_repo_monorepo, tmp_path, cap_db
+):
+    monkeypatch.setenv("BLOY_STOREFRONT_URL", "https://custom-test-store.myshopify.com")
+    monkeypatch.setenv("BLOY_STOREFRONT_PASSWORD", "hunter2")
+
+    _, _, seen = _staging_run(monkeypatch, two_repo_monorepo, tmp_path)
+
+    assert "https://custom-test-store.myshopify.com" in seen["prompt"]
+    assert "`hunter2`" in seen["prompt"]
+
+
+def test_a_ticket_touching_only_api_never_activates_staging(
+    monkeypatch, monorepo, tmp_path, cap_db
+):
+    """No cms anywhere in the repo list — the cheap outer gate must refuse
+    before any token is minted or the prompt grows the staging block."""
+    ok = pipeline.sandbox_runner.SandboxResult(True, "đã sửa", "sb", 0)
+    client, outcome = _run(monkeypatch, monorepo, tmp_path, sandbox_result=ok, changed=True)
+
+    assert outcome.ok is True
+    assert pipeline.staging_tokens.active() is None
+
+
+def test_staging_token_is_revoked_after_a_successful_run(
+    monkeypatch, two_repo_monorepo, tmp_path, cap_db
+):
+    _, outcome, _ = _staging_run(monkeypatch, two_repo_monorepo, tmp_path, sandbox_ok=True)
+
+    assert outcome.ok is True
+    assert pipeline.staging_tokens.active() is None
+
+
+def test_staging_token_is_revoked_after_a_failed_run(
+    monkeypatch, two_repo_monorepo, tmp_path, cap_db
+):
+    _, outcome, seen = _staging_run(monkeypatch, two_repo_monorepo, tmp_path, sandbox_ok=False)
+
+    assert outcome.ok is False
+    assert seen["staging_token"], "the token must have been minted before the sandbox ran"
+    assert pipeline.staging_tokens.active() is None
+
+
+def test_a_second_ui_ticket_is_refused_while_staging_is_held(
+    monkeypatch, two_repo_monorepo, tmp_path, cap_db
+):
+    """Staging is one shared environment — a second run must never be allowed
+    to deploy over the first one's in-flight work."""
+    pipeline.staging_tokens.mint(
+        "some-other-run", issue_key="BLOY-1", worktrees={}, ttl_minutes=30,
+    )
+
+    client, outcome, seen = _staging_run(monkeypatch, two_repo_monorepo, tmp_path)
+
+    assert outcome.ok is False
+    assert outcome.stage == "staging-busy"
+    assert "staging" not in seen, "the sandbox must never even be called"
+    assert "Staging đang bị giữ" in outcome.detail
+
+
+def test_being_refused_by_staging_contention_does_not_count_against_the_cap(
+    monkeypatch, two_repo_monorepo, tmp_path, cap_db
+):
+    """Staging being busy is not this ticket's fault — it must not burn one
+    of its attempt-cap slots the way a real sandbox failure does."""
+    pipeline.staging_tokens.mint(
+        "some-other-run", issue_key="BLOY-1", worktrees={}, ttl_minutes=30,
+    )
+
+    _staging_run(monkeypatch, two_repo_monorepo, tmp_path)
+
+    assert cap_db.attempt_status("issue-multi", "BLOY-99").failed == 0
 
 
 # ---------------------------------------------------------------------------

@@ -28,6 +28,7 @@ import os
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 
 from bloy_dev_agent.db import init_db
+from bloy_dev_agent.service import load_env
 from bloy_dev_agent.staging_control import actions, apps
 from bloy_dev_agent.staging_control.tokens import StagingGrant, purge_expired, resolve
 
@@ -68,6 +69,14 @@ def _app_or_400(key: str) -> apps.StagingApp:
 
 def create_app() -> FastAPI:
     app = FastAPI(title="BLOY Staging Control", docs_url=None, redoc_url=None)
+    # Same loader the main service uses — a bearer-token-only service still
+    # needs its own env (SHOPIFY_CLI_PARTNERS_TOKEN for `deploy`'s `shopify
+    # app deploy` step) filled in, since PM2 never reliably carries one.
+    env_file = load_env()
+    logger.info(
+        "bloy_dev_agent: staging_control env from %s",
+        env_file or "process environment only",
+    )
     init_db()
     purge_expired()
 

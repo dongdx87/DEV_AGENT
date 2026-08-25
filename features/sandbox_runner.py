@@ -63,6 +63,16 @@ DEFAULT_TIMEOUT_MINUTES = 30
 #: tickets that never touch a browser.
 STAGING_IMAGE = "bloy-dev-agent/sandbox-chromium:v1"
 
+#: The Chromium binary that image actually installed — confirmed live inside
+#: a real container. Without this, @playwright/mcp's default `--browser`
+#: channel is "chrome" (real Google Chrome), which this image never installs
+#: — a real staging-verify run hit exactly that: "Chromium distribution
+#: 'chrome' is not found at /opt/google/chrome/chrome", and the agent user has
+#: no permission to `npx playwright install chrome` to fix it itself. Pinned
+#: the same way NODE_VERSION is — bump this alongside sandbox_image/Dockerfile
+#: if it ever installs a different Playwright/Chromium revision.
+STAGING_CHROMIUM_EXECUTABLE = "/opt/ms-playwright/chromium-1237/chrome-linux64/chrome"
+
 #: A staging-verify run compiles the CMS frontend and drives a real Chromium —
 #: the 1 CPU / 2Gi default (opensandbox-server's own default, not set here)
 #: starves both. Only passed to Sandbox.create() when staging is requested.
@@ -94,8 +104,17 @@ STAGING_EGRESS_ALLOW: tuple[str, ...] = (
     "*.myshopify.com",
     "cdn.shopify.com",
     "monorail-edge.shopifysvc.com",
-    "dev-bloy-api-staging.dev-bsscommerce.com",
-    "dev-bloy-cms-staging.dev-bsscommerce.com",
+    # These two were previously stale ("dev-bloy-api-staging"/"dev-bloy-cms-
+    # staging") — a real name that never existed, not the tunnel actually
+    # deployed. Confirmed live: a real staging-verify run tried to reach the
+    # real CMS tunnel domain, got ERR_NAME_NOT_RESOLVED — dns+nft blocks even
+    # the DNS lookup for anything off this list, so a stale entry here fails
+    # exactly like a missing one. Cross-checked against the staging
+    # checkout's own web/.env (VITE_HOST / VITE_SERVER_URL) and
+    # shopify.app.toml's application_url, which are the actual source of
+    # truth for these hostnames.
+    "dev-dongdx2k3-bloy-staging-api.dev-bsscommerce.com",
+    "dev-dongdx2k3-bloy-staging-cms.dev-bsscommerce.com",
     "dev-dongdx2k3-bloy-staging-control.dev-bsscommerce.com",
 )
 
@@ -103,6 +122,18 @@ WORKTREE_MOUNT = "/worktrees"
 NVM_MOUNT = "/opt/nvm"
 #: Monorepo root, read-only, so the agent can read CLAUDE.md and sibling projects.
 MONOREPO_MOUNT = "/monorepo"
+
+#: A logged-in Shopify admin session, captured once by a human on a real
+#: display (2FA and Shopify's bot-check interstitial both need a person; a
+#: headless container has neither) and reused read-only by every
+#: staging-verify run after that. This directory holds ONLY the exported
+#: Playwright ``storageState`` (cookies) — never a plaintext password, and
+#: never written to from inside the container. Sibling to $HOME, same
+#: reasoning as DEFAULT_MONOREPO_MIRROR: outside every worktree, so it can
+#: never be swept into a merge request.
+SHOPIFY_AUTH_DIR = Path.home() / ".bloy-shopify-auth"
+SHOPIFY_AUTH_MOUNT = "/shopify-auth"
+SHOPIFY_STORAGE_STATE_FILENAME = "storage-state.json"
 
 #: Where the filtered copy of the monorepo is kept, sibling to the worktree
 #: root. A plain bind-mount of the real monorepo hands every sandbox every
@@ -254,10 +285,26 @@ def _network_policy(allow: tuple[str, ...]):
     )
 
 
+def _shopify_storage_state_path(shopify_auth_dir: Path | None) -> Path | None:
+    """The exported session file, if a human has actually captured one.
+
+    Checked as a file (not just the directory) so a directory that exists but
+    is still empty — nobody has logged in yet — is treated the same as no
+    directory at all: no volume, no storageState key, a plain logged-out
+    browser inside the container.
+    """
+    if shopify_auth_dir is None:
+        return None
+    candidate = shopify_auth_dir / SHOPIFY_STORAGE_STATE_FILENAME
+    return candidate if candidate.is_file() else None
+
+
 def _volumes(
     worktree_root: Path,
     monorepo: Path | None = None,
     skill_packs_root: Path | None = None,
+    shopify_auth_dir: Path | None = None,
+    agent_repos_root: Path | None = None,
 ):
     from opensandbox.models.sandboxes import Host, Volume
 
@@ -271,6 +318,28 @@ def _volumes(
             name="nvm", host=Host(path=str(HOST_NVM)), mount_path=NVM_MOUNT, read_only=True
         ),
     ]
+
+    # workspace.prepare() branches worktrees from this mirror whenever it
+    # exists, never from the developer's own checkout (see its own docstring).
+    # A linked worktree's ``.git`` file is a pointer to an ABSOLUTE HOST PATH
+    # back into this mirror's ``.git/worktrees/<branch>`` admin dir — mounted
+    # at the identical path so that pointer still resolves inside the
+    # container. Confirmed live: without this, every git command run from
+    # inside such a worktree fails outright ("not a git repository"), because
+    # the mirror simply does not exist in the container's filesystem — the
+    # agent can still edit files (the worktree's working tree itself lives
+    # under ``worktree_root``, mounted above), it just cannot see its own
+    # history or diff. Read-write, unlike ``monorepo`` below: git needs to
+    # write the worktree's HEAD/index under here on every commit, not just
+    # read it.
+    if agent_repos_root is not None and agent_repos_root.is_dir():
+        volumes.append(
+            Volume(
+                name="agent-repos",
+                host=Host(path=str(agent_repos_root)),
+                mount_path=str(agent_repos_root),
+            )
+        )
     # No volume for ~/.claude: it holds MCP refresh tokens this pipeline never
     # uses and, in settings.json, a live third-party API token (see module
     # docstring). Only the two filtered JSON blobs the setup script writes
@@ -297,6 +366,20 @@ def _volumes(
                 name="skill-packs",
                 host=Host(path=str(skill_packs_root)),
                 mount_path=SKILLS_MOUNT,
+                read_only=True,
+            )
+        )
+
+    # Mounted whole-directory (not the single file) to match every other
+    # volume here — and only when the file itself is actually present, so a
+    # human who hasn't captured a session yet (or let it lapse) gets no
+    # volume at all rather than an empty mount or a mount-time error.
+    if _shopify_storage_state_path(shopify_auth_dir) is not None:
+        volumes.append(
+            Volume(
+                name="shopify-auth",
+                host=Host(path=str(shopify_auth_dir)),
+                mount_path=SHOPIFY_AUTH_MOUNT,
                 read_only=True,
             )
         )
@@ -327,17 +410,42 @@ def container_path(worktree: Path, worktree_root: Path) -> str:
     return f"{WORKTREE_MOUNT}/{worktree.relative_to(worktree_root)}"
 
 
-def claude_flags(implement: bool) -> str:
+def _token_export(staging_token: str) -> str:
+    """The staging_control capability token, as a shell-safe env export.
+
+    Rides in an env var, never a file: anything written under the
+    bind-mounted worktree is fair game for `git add -A` and could end up
+    committed straight into a merge request.
+    """
+    if not staging_token:
+        return ""
+    return f" BLOY_STAGING_TOKEN={shlex.quote(staging_token)}"
+
+
+def claude_flags(implement: bool, staging: bool = False) -> str:
     """CLI flags for the run.
 
     ``--dangerously-skip-permissions`` is the point of the container: the agent
     must not stop for a confirmation nobody is there to answer, and the mounts
     already bound what it can reach. Analysis mode gets neither that flag nor
     any write tool, so a misconfigured routine cannot edit code by accident.
+
+    ``staging`` appends ``--mcp-config <path> --strict-mcp-config`` — the only
+    way that actually works to hand a non-interactive, single-shot ``claude
+    -p`` call an MCP server. Confirmed live the wrong way first: `claude -p`
+    never auto-discovers a bare ``.mcp.json`` sitting in ``$HOME`` (it only
+    checks its own cwd, or entries already inside ``~/.claude.json``) — a real
+    run reported no Playwright tool was available at all despite the file
+    existing there with valid content. ``--strict-mcp-config`` on top means
+    nothing else gets a chance to auto-load either, so this stays the one and
+    only source of MCP servers for a staging run.
     """
-    if implement:
-        return "--dangerously-skip-permissions"
-    return "--allowedTools Read Grep Glob --permission-mode plan"
+    base = "--dangerously-skip-permissions" if implement else (
+        "--allowedTools Read Grep Glob --permission-mode plan"
+    )
+    if not staging:
+        return base
+    return f"{base} --mcp-config {MCP_CONFIG_PATH} --strict-mcp-config"
 
 
 def _b64(data: str) -> str:
@@ -383,13 +491,47 @@ def _filtered_claude_json(text: str) -> str:
     return json.dumps(data)
 
 
-#: Written into the container's $HOME, never the worktree — same reasoning as
-#: skill packs: a `.mcp.json` living inside a repo's own worktree would be
-#: swept into the merge request by `git add -A`. Only materialized for a
-#: staging-verify run; an ordinary ticket's container never sees it, so
-#: build_prompt(staging=None) and this setup script both stay byte-identical
-#: to today's behaviour when staging is not requested.
-PLAYWRIGHT_LAUNCH_CONFIG_PATH = f"{AGENT_HOME}/.playwright-mcp-config.json"
+#: Deliberately under /tmp, not $AGENT_HOME — confirmed live against the real
+#: STAGING_IMAGE that its base already ships a uid-1000 "ubuntu" account, so
+#: RESOLVE_AGENT_USER adopts that instead of ever creating "bloy", and its
+#: real home is /home/ubuntu. AGENT_HOME (a Python-side guess computed before
+#: the container even exists) does not track that, and every other file this
+#: script writes into $HOME already reaches it through the shell's own "$h"
+#: (resolved at runtime), not a precomputed constant — this path is the one
+#: exception, so it lives somewhere no image's user layout can get wrong.
+#: Written once by root during setup and made world-readable, since the later
+#: `claude -p` (and the Playwright MCP process it spawns) run as the
+#: unprivileged agent user, not root. Never the worktree either, for the same
+#: reason as skill packs: anything there is swept into the merge request by
+#: `git add -A`. Only materialized for a staging-verify run; an ordinary
+#: ticket's container never sees it, so build_prompt(staging=None) and this
+#: setup script both stay byte-identical to today's behaviour when staging is
+#: not requested.
+PLAYWRIGHT_LAUNCH_CONFIG_PATH = "/tmp/bloy-playwright-mcp-config.json"
+
+#: Where the ``.mcp.json`` stanza itself lives. Deliberately NOT
+#: ``$HOME/.mcp.json`` — confirmed live (a real staging-verify run reported
+#: "no Playwright/browser tool available" despite the file existing there
+#: with valid content) that `claude -p` never auto-discovers a bare
+#: ``.mcp.json`` sitting in ``$HOME``. It only auto-discovers one in its own
+#: *working directory* (the ticket's worktree here — never an option, see
+#: below) or entries already inside ``~/.claude.json``. The reliable way to
+#: hand a non-interactive, single-shot `claude -p` call an MCP server is the
+#: explicit ``--mcp-config`` flag (paired with ``--strict-mcp-config`` so
+#: nothing else gets a chance to auto-load), which is what actually gets used
+#: — this constant only needs to be a path Python and the shell agree on.
+MCP_CONFIG_PATH = "/tmp/bloy-mcp.json"
+
+#: Where Playwright MCP saves its own snapshot/trace/console-log files by
+#: default: ``.playwright-mcp/`` under its CWD, which for a staging run IS
+#: the ticket's own git worktree (``claude -p`` is invoked with ``cd
+#: <worktree> && ...``). Confirmed live — the hard way: a real run's
+#: `browser_navigate` call wrote ``.playwright-mcp/page-*.yml`` straight into
+#: a ticket's worktree, `git add -A` swept it in, and it was pushed as a real
+#: merge request containing nothing but that leaked file. Same class of bug
+#: as ``.mcp.json`` almost being written into the worktree, same fix: an
+#: explicit ``--output-dir`` outside every worktree.
+STAGING_MCP_OUTPUT_DIR = "/tmp/bloy-playwright-output"
 
 
 def _staging_mcp_json() -> str:
@@ -398,6 +540,13 @@ def _staging_mcp_json() -> str:
     ``--headless`` because the container has no display; ``--no-sandbox``
     because ``~/.sandbox.toml`` already drops ``SYS_ADMIN`` for every
     sandbox, so Chromium's own sandbox cannot initialise without it.
+    ``--executable-path`` because @playwright/mcp's default browser channel
+    ("chrome" — real Google Chrome) is never installed in this image, only
+    the pinned Chromium build at :data:`STAGING_CHROMIUM_EXECUTABLE` is, and
+    the unprivileged agent user cannot install it itself. ``--output-dir``
+    because its own default output location is the worktree — see
+    :data:`STAGING_MCP_OUTPUT_DIR`'s docstring for what that leaked in
+    practice.
     """
     return json.dumps(
         {
@@ -409,6 +558,10 @@ def _staging_mcp_json() -> str:
                         "@playwright/mcp@latest",
                         "--headless",
                         "--no-sandbox",
+                        "--executable-path",
+                        STAGING_CHROMIUM_EXECUTABLE,
+                        "--output-dir",
+                        STAGING_MCP_OUTPUT_DIR,
                         "--config",
                         PLAYWRIGHT_LAUNCH_CONFIG_PATH,
                     ],
@@ -419,14 +572,32 @@ def _staging_mcp_json() -> str:
     )
 
 
-#: ``--disable-dev-shm-usage``, the second mandatory flag: Docker's default
-#: /dev/shm is 64MB and nothing in the sandbox server config raises it, so
-#: Chromium must be told to spill into /tmp instead or it crashes on the
-#: first real page. This is a launch option, not a CLI flag of the MCP server
-#: itself, hence its own small config file rather than another --arg.
-PLAYWRIGHT_LAUNCH_CONFIG = json.dumps(
-    {"browser": {"launchOptions": {"args": ["--disable-dev-shm-usage"]}}}
-)
+def _playwright_launch_config(storage_state_mounted: bool) -> str:
+    """Chromium launch flags, plus a logged-in session when one is mounted.
+
+    ``--disable-dev-shm-usage`` is the second mandatory flag regardless of
+    staging content: Docker's default /dev/shm is 64MB and nothing in the
+    sandbox server config raises it, so Chromium must be told to spill into
+    /tmp instead or it crashes on the first real page. This is a launch
+    option, not a CLI flag of the MCP server itself, hence its own small
+    config file rather than another --arg.
+
+    ``contextOptions.storageState`` is added only when
+    :func:`_shopify_storage_state_path` actually found a file — confirmed
+    against the installed ``@playwright/mcp`` (``--help`` and its
+    ``config.d.ts``) to be a real, supported key forwarded straight to
+    Playwright's ``BrowserContextOptions.storageState``, not a guess. Its
+    absence here (no captured session yet, or one that's expired) is the
+    graceful-degradation path: Playwright MCP simply opens a fresh, logged-out
+    context, and the agent hits Shopify's login wall and reports that in its
+    own answer — no Python-side branch needed for that outcome.
+    """
+    config: dict = {"browser": {"launchOptions": {"args": ["--disable-dev-shm-usage"]}}}
+    if storage_state_mounted:
+        config["browser"]["contextOptions"] = {
+            "storageState": f"{SHOPIFY_AUTH_MOUNT}/{SHOPIFY_STORAGE_STATE_FILENAME}"
+        }
+    return json.dumps(config)
 
 
 def _skill_copy_lines(
@@ -472,6 +643,7 @@ def _setup_script(
     skill_packs_root: Path | None = None,
     run_id: str = "",
     staging: bool = False,
+    shopify_auth_dir: Path | None = None,
 ) -> str:
     """Create the agent user, install its Claude login, and drop the prompt in.
 
@@ -500,11 +672,22 @@ def _setup_script(
         ]
     mcp_lines: list[str] = []
     if staging:
+        storage_state_mounted = _shopify_storage_state_path(shopify_auth_dir) is not None
+        launch_config = _playwright_launch_config(storage_state_mounted)
         mcp_lines = [
             f"printf '%s' {shlex.quote(_b64(_staging_mcp_json()))} | base64 -d "
-            '> "$h/.mcp.json"',
-            f"printf '%s' {shlex.quote(_b64(PLAYWRIGHT_LAUNCH_CONFIG))} | base64 -d "
+            f"> {shlex.quote(MCP_CONFIG_PATH)}",
+            f"printf '%s' {shlex.quote(_b64(launch_config))} | base64 -d "
             f"> {shlex.quote(PLAYWRIGHT_LAUNCH_CONFIG_PATH)}",
+            # Both outside "$h", so the chown -R "$h" below never reaches
+            # them — the agent user (not root) is who actually reads them,
+            # and `claude -p` reads MCP_CONFIG_PATH via --mcp-config, never
+            # by auto-discovering a bare .mcp.json (see MCP_CONFIG_PATH's
+            # own docstring for why $HOME never worked for this).
+            f"chmod 644 {shlex.quote(MCP_CONFIG_PATH)} "
+            f"{shlex.quote(PLAYWRIGHT_LAUNCH_CONFIG_PATH)}",
+            f"mkdir -p {shlex.quote(STAGING_MCP_OUTPUT_DIR)}",
+            f"chown -R {AGENT_UID}:{AGENT_GID} {shlex.quote(STAGING_MCP_OUTPUT_DIR)}",
         ]
     return "\n".join(
         [
@@ -547,6 +730,9 @@ async def _run_async(
     enabled_skills: list[skill_packs.SkillPack] | None = None,
     skill_packs_root: Path | None = None,
     staging: bool = False,
+    shopify_auth_dir: Path | None = None,
+    staging_token: str = "",
+    agent_repos_root: Path | None = None,
 ) -> SandboxResult:
     from opensandbox import Sandbox
 
@@ -568,7 +754,10 @@ async def _run_async(
         image,
         timeout=timedelta(minutes=timeout_minutes),
         connection_config=_connection(),
-        volumes=_volumes(worktree_root, monorepo_mount, skill_packs_root),
+        volumes=_volumes(
+            worktree_root, monorepo_mount, skill_packs_root, shopify_auth_dir,
+            agent_repos_root,
+        ),
         metadata={"owner": OWNER_TAG, "run_id": run_id or "adhoc"},
         network_policy=_network_policy(STAGING_EGRESS_ALLOW) if staging else None,
         resource=STAGING_RESOURCE if staging else None,
@@ -578,7 +767,9 @@ async def _run_async(
 
     try:
         setup = await sandbox.commands.run(
-            _setup_script(prompt, enabled_skills, skill_packs_root, run_id, staging)
+            _setup_script(
+                prompt, enabled_skills, skill_packs_root, run_id, staging, shopify_auth_dir
+            )
         )
         setup_output = _text(setup)
         if "NO_CREDENTIALS" in setup_output:
@@ -588,7 +779,7 @@ async def _run_async(
                 False, f"Sandbox setup failed:\n{setup_output}", sandbox_id, 1
             )
 
-        flags = claude_flags(implement)
+        flags = claude_flags(implement, staging=staging)
         redirect = ""
         if run_id:
             log_in_container = agent_log.container_log_path(WORKTREE_MOUNT, run_id)
@@ -599,7 +790,7 @@ async def _run_async(
                 f" > {shlex.quote(log_in_container)} 2> {shlex.quote(STDERR_PATH)}"
             )
         inner = (
-            f"export PATH={node_bin}:$PATH CI=true; "
+            f"export PATH={node_bin}:$PATH CI=true{_token_export(staging_token)}; "
             f"cd {shlex.quote(workdir)} && "
             f"cat {PROMPT_PATH} | claude -p {flags}{redirect}"
         )
@@ -669,6 +860,9 @@ def run_in_sandbox(
     enabled_skills: list[skill_packs.SkillPack] | None = None,
     skill_packs_root: Path | None = None,
     staging: bool = False,
+    shopify_auth_dir: Path | None = None,
+    staging_token: str = "",
+    agent_repos_root: Path | None = None,
 ) -> SandboxResult:
     """Run one prompt against ``worktree`` inside a fresh sandbox.
 
@@ -677,8 +871,18 @@ def run_in_sandbox(
     policy that denies everything except :data:`STAGING_EGRESS_ALLOW` — an
     ordinary ticket never sets it, so its sandbox's network stays exactly as
     open (or closed) as it is today.
+
+    ``shopify_auth_dir`` defaults to :data:`SHOPIFY_AUTH_DIR` whenever
+    ``staging`` is true and no override is given — there is only ever one such
+    directory on a host, so requiring every caller to repeat it would just be
+    a chance to forget it. Pass an explicit path (e.g. in tests) to override.
     """
     effective_image = STAGING_IMAGE if staging and image == DEFAULT_IMAGE else image
+    effective_auth_dir = (
+        shopify_auth_dir
+        if shopify_auth_dir is not None
+        else (SHOPIFY_AUTH_DIR if staging else None)
+    )
     try:
         return _run_coroutine(
             lambda: _run_async(
@@ -693,6 +897,9 @@ def run_in_sandbox(
                 enabled_skills=enabled_skills,
                 skill_packs_root=skill_packs_root,
                 staging=staging,
+                shopify_auth_dir=effective_auth_dir,
+                staging_token=staging_token,
+                agent_repos_root=agent_repos_root,
             )
         )
     except SandboxError as exc:

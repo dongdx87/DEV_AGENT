@@ -82,6 +82,23 @@ def test_analysis_mode_never_gets_the_write_flag():
     assert sandbox_runner.claude_flags(True) == "--dangerously-skip-permissions"
 
 
+def test_staging_adds_the_explicit_mcp_config_flags():
+    """`claude -p` never auto-discovers a bare .mcp.json in $HOME (confirmed
+    live: a real run reported no Playwright tool available at all despite
+    the file existing there) — --mcp-config is the only thing that works for
+    a non-interactive, single-shot call, so staging must always add it."""
+    flags = sandbox_runner.claude_flags(True, staging=True)
+
+    assert f"--mcp-config {sandbox_runner.MCP_CONFIG_PATH}" in flags
+    assert "--strict-mcp-config" in flags
+    assert "--dangerously-skip-permissions" in flags
+
+
+def test_an_ordinary_run_never_gets_the_mcp_config_flags():
+    assert sandbox_runner.claude_flags(True, staging=False) == "--dangerously-skip-permissions"
+    assert sandbox_runner.claude_flags(True) == "--dangerously-skip-permissions"
+
+
 def test_the_prompt_is_never_interpolated_into_the_shell():
     """Issue bodies are untrusted text; they must arrive base64-encoded."""
     hostile = 'title"; rm -rf / #\n`whoami`\n$(id)'
@@ -138,6 +155,38 @@ def test_a_missing_monorepo_is_simply_not_mounted(tmp_path):
     volumes = sandbox_runner._volumes(tmp_path / "wt", tmp_path / "absent")
 
     assert all(v.mount_path != sandbox_runner.MONOREPO_MOUNT for v in volumes)
+
+
+def test_the_agent_repos_mirror_is_mounted_read_write_at_its_own_host_path(tmp_path):
+    """A linked worktree's ``.git`` file points straight back at this mirror's
+    absolute host path (``.git/worktrees/<branch>``) — mounting it anywhere
+    else leaves every git command run from inside the worktree unable to find
+    its own repository. Confirmed live: without this mount, a real run
+    reported git as simply broken and worked blind, unable to see its own
+    diff or history.
+    """
+    mirror = tmp_path / "bloy-dev-agent-repos"
+    mirror.mkdir()
+
+    volumes = sandbox_runner._volumes(tmp_path / "wt", agent_repos_root=mirror)
+
+    mount = next(v for v in volumes if v.mount_path == str(mirror))
+    assert mount.read_only is not True, (
+        "git must be able to write the worktree's HEAD/index under here on commit"
+    )
+
+
+def test_a_missing_agent_repos_mirror_is_simply_not_mounted(tmp_path):
+    volumes = sandbox_runner._volumes(tmp_path / "wt", agent_repos_root=tmp_path / "absent")
+
+    assert all(v.mount_path != str(tmp_path / "absent") for v in volumes)
+
+
+def test_no_agent_repos_root_given_mounts_nothing_extra(tmp_path):
+    volumes = sandbox_runner._volumes(tmp_path / "wt")
+
+    writable = [v.mount_path for v in volumes if not v.read_only]
+    assert writable == [sandbox_runner.WORKTREE_MOUNT]
 
 
 # ---------------------------------------------------------------------------
@@ -496,12 +545,17 @@ def test_an_ordinary_run_never_writes_mcp_json():
     assert "playwright-mcp-config" not in script
 
 
-def test_a_staging_run_writes_mcp_json_and_the_launch_config_into_home():
+def test_a_staging_run_writes_mcp_json_and_the_launch_config():
+    """Both files live under /tmp, never $HOME — `claude -p` only ever reads
+    the MCP one via an explicit --mcp-config flag (see claude_flags), never by
+    auto-discovering a bare .mcp.json sitting in $HOME. A real run confirmed
+    the auto-discovery path silently finds nothing there."""
     script = sandbox_runner._setup_script("do the thing", staging=True)
 
     assert sandbox_runner._b64(sandbox_runner._staging_mcp_json()) in script
-    assert sandbox_runner._b64(sandbox_runner.PLAYWRIGHT_LAUNCH_CONFIG) in script
-    assert '"$h/.mcp.json"' in script
+    assert sandbox_runner._b64(sandbox_runner._playwright_launch_config(False)) in script
+    assert sandbox_runner.MCP_CONFIG_PATH in script
+    assert '"$h/.mcp.json"' not in script
     assert sandbox_runner.PLAYWRIGHT_LAUNCH_CONFIG_PATH in script
 
 
@@ -515,12 +569,227 @@ def test_the_staging_mcp_stanza_forces_headless_and_no_sandbox():
     assert "--no-sandbox" in args
 
 
+def test_the_staging_mcp_stanza_pins_the_installed_chromium():
+    """@playwright/mcp defaults to the "chrome" channel, which this image
+    never installs — a real run hit exactly that ("Chromium distribution
+    'chrome' is not found") and the agent user has no permission to install
+    it. --executable-path must point at the Chromium this image actually has."""
+    stanza = json.loads(sandbox_runner._staging_mcp_json())
+
+    args = stanza["mcpServers"]["playwright"]["args"]
+    assert "--executable-path" in args
+    idx = args.index("--executable-path")
+    assert args[idx + 1] == sandbox_runner.STAGING_CHROMIUM_EXECUTABLE
+
+
+def test_the_staging_mcp_stanza_never_writes_output_into_the_worktree():
+    """Playwright MCP's own default output dir (.playwright-mcp/ under its
+    CWD) IS the ticket's worktree for a staging run — confirmed live the hard
+    way: a real run's browser_navigate wrote a snapshot .yml straight into a
+    worktree, git add -A swept it in, and it was pushed as a real merge
+    request containing nothing but that leaked file. --output-dir must always
+    point somewhere outside every worktree."""
+    stanza = json.loads(sandbox_runner._staging_mcp_json())
+
+    args = stanza["mcpServers"]["playwright"]["args"]
+    assert "--output-dir" in args
+    idx = args.index("--output-dir")
+    assert args[idx + 1] == sandbox_runner.STAGING_MCP_OUTPUT_DIR
+    assert sandbox_runner.WORKTREE_MOUNT not in sandbox_runner.STAGING_MCP_OUTPUT_DIR
+
+
+def test_the_setup_script_creates_and_owns_the_mcp_output_dir():
+    script = sandbox_runner._setup_script("do the thing", staging=True)
+
+    assert f"mkdir -p {sandbox_runner.STAGING_MCP_OUTPUT_DIR}" in script
+    assert sandbox_runner.STAGING_MCP_OUTPUT_DIR in script
+
+
 def test_the_playwright_launch_config_disables_dev_shm():
     """Docker's default /dev/shm is 64MB with no server-config knob to raise
     it — Chromium needs to be told to spill into /tmp instead or it crashes."""
-    config = json.loads(sandbox_runner.PLAYWRIGHT_LAUNCH_CONFIG)
+    config = json.loads(sandbox_runner._playwright_launch_config(False))
 
     assert "--disable-dev-shm-usage" in config["browser"]["launchOptions"]["args"]
+    assert "contextOptions" not in config["browser"]
+
+
+def test_the_playwright_launch_config_adds_storage_state_only_when_mounted():
+    without = json.loads(sandbox_runner._playwright_launch_config(False))
+    with_state = json.loads(sandbox_runner._playwright_launch_config(True))
+
+    assert "contextOptions" not in without["browser"]
+    assert with_state["browser"]["contextOptions"]["storageState"] == (
+        f"{sandbox_runner.SHOPIFY_AUTH_MOUNT}/{sandbox_runner.SHOPIFY_STORAGE_STATE_FILENAME}"
+    )
+    # Disabling dev-shm must not get lost once storageState is layered in.
+    assert "--disable-dev-shm-usage" in with_state["browser"]["launchOptions"]["args"]
+
+
+# ---------------------------------------------------------------------------
+# Shopify session reuse: mount, config wiring, graceful absence
+# ---------------------------------------------------------------------------
+
+
+def test_no_session_file_means_no_volume_and_no_storage_state_key(tmp_path):
+    """A directory that exists but is still empty (nobody has captured a
+    session yet) must behave exactly like no directory at all."""
+    empty_dir = tmp_path / "auth"
+    empty_dir.mkdir()
+
+    assert sandbox_runner._shopify_storage_state_path(empty_dir) is None
+    assert sandbox_runner._shopify_storage_state_path(None) is None
+
+    volumes = sandbox_runner._volumes(tmp_path / "wt", shopify_auth_dir=empty_dir)
+    assert not any(v.name == "shopify-auth" for v in volumes)
+
+    script = sandbox_runner._setup_script(
+        "do the thing", staging=True, shopify_auth_dir=empty_dir
+    )
+    assert "storageState" not in script
+
+
+def test_a_captured_session_is_mounted_read_only_and_referenced_in_the_config(tmp_path):
+    auth_dir = tmp_path / "auth"
+    auth_dir.mkdir()
+    (auth_dir / sandbox_runner.SHOPIFY_STORAGE_STATE_FILENAME).write_text(
+        "{}", encoding="utf-8"
+    )
+
+    path = sandbox_runner._shopify_storage_state_path(auth_dir)
+    assert path == auth_dir / sandbox_runner.SHOPIFY_STORAGE_STATE_FILENAME
+
+    volumes = sandbox_runner._volumes(tmp_path / "wt", shopify_auth_dir=auth_dir)
+    (volume,) = [v for v in volumes if v.name == "shopify-auth"]
+    assert volume.mount_path == sandbox_runner.SHOPIFY_AUTH_MOUNT
+    assert volume.read_only is True
+    assert volume.host.path == str(auth_dir)
+
+    script = sandbox_runner._setup_script(
+        "do the thing", staging=True, shopify_auth_dir=auth_dir
+    )
+    expected_config = sandbox_runner._playwright_launch_config(True)
+    assert sandbox_runner._b64(expected_config) in script
+
+
+def test_an_ordinary_non_staging_run_never_mounts_the_shopify_session(tmp_path):
+    """staging=False must stay byte-for-byte what it was before this feature —
+    the mount only happens via the staging-only mcp_lines branch."""
+    auth_dir = tmp_path / "auth"
+    auth_dir.mkdir()
+    (auth_dir / sandbox_runner.SHOPIFY_STORAGE_STATE_FILENAME).write_text(
+        "{}", encoding="utf-8"
+    )
+
+    script = sandbox_runner._setup_script(
+        "do the thing", staging=False, shopify_auth_dir=auth_dir
+    )
+    assert "storageState" not in script
+    assert ".mcp.json" not in script
+
+
+def test_run_in_sandbox_defaults_the_auth_dir_when_staging(monkeypatch):
+    captured: dict = {}
+
+    def fake_run_coroutine(factory):
+        import inspect
+
+        captured.update(inspect.getclosurevars(factory).nonlocals)
+        return sandbox_runner.SandboxResult(True, "ok")
+
+    monkeypatch.setattr(sandbox_runner, "_run_coroutine", fake_run_coroutine)
+
+    from pathlib import Path
+
+    sandbox_runner.run_in_sandbox(
+        "do the thing", Path("/wt/x"), worktree_root=Path("/wt"), staging=True,
+    )
+
+    assert captured["effective_auth_dir"] == sandbox_runner.SHOPIFY_AUTH_DIR
+
+
+def test_run_in_sandbox_keeps_an_explicit_auth_dir_override(monkeypatch, tmp_path):
+    captured: dict = {}
+
+    def fake_run_coroutine(factory):
+        import inspect
+
+        captured.update(inspect.getclosurevars(factory).nonlocals)
+        return sandbox_runner.SandboxResult(True, "ok")
+
+    monkeypatch.setattr(sandbox_runner, "_run_coroutine", fake_run_coroutine)
+
+    from pathlib import Path
+
+    sandbox_runner.run_in_sandbox(
+        "do the thing", Path("/wt/x"), worktree_root=Path("/wt"), staging=True,
+        shopify_auth_dir=tmp_path,
+    )
+
+    assert captured["effective_auth_dir"] == tmp_path
+
+
+def test_run_in_sandbox_without_staging_never_defaults_the_auth_dir(monkeypatch):
+    captured: dict = {}
+
+    def fake_run_coroutine(factory):
+        import inspect
+
+        captured.update(inspect.getclosurevars(factory).nonlocals)
+        return sandbox_runner.SandboxResult(True, "ok")
+
+    monkeypatch.setattr(sandbox_runner, "_run_coroutine", fake_run_coroutine)
+
+    from pathlib import Path
+
+    sandbox_runner.run_in_sandbox("do the thing", Path("/wt/x"), worktree_root=Path("/wt"))
+
+    assert captured["effective_auth_dir"] is None
+
+
+def test_the_staging_token_rides_an_env_var_never_a_file():
+    """It must never be written under the bind-mounted worktree — anything
+    there is fair game for `git add -A` and could end up committed."""
+    assert sandbox_runner._token_export("secret-token-abc") == (
+        " BLOY_STAGING_TOKEN=secret-token-abc"
+    )
+    assert sandbox_runner._token_export("") == ""
+
+
+def test_the_staging_token_export_is_shell_quoted():
+    """A token is opaque server-generated data, not something to trust blindly
+    in a shell string — a value with shell metacharacters must round-trip
+    exactly, not get interpreted by the shell."""
+    import shlex
+
+    raw = "a$b`c;d"
+    export = sandbox_runner._token_export(raw)
+    # export looks like " BLOY_STAGING_TOKEN=<quoted>" — split it as the shell
+    # would and confirm the value comes back untouched.
+    _, assignment = shlex.split(f"x{export}")
+    _, _, value = assignment.partition("=")
+    assert value == raw
+
+
+def test_run_in_sandbox_passes_the_staging_token_through(monkeypatch):
+    captured: dict = {}
+
+    def fake_run_coroutine(factory):
+        import inspect
+
+        captured.update(inspect.getclosurevars(factory).nonlocals)
+        return sandbox_runner.SandboxResult(True, "ok")
+
+    monkeypatch.setattr(sandbox_runner, "_run_coroutine", fake_run_coroutine)
+
+    from pathlib import Path
+
+    sandbox_runner.run_in_sandbox(
+        "do the thing", Path("/wt/x"), worktree_root=Path("/wt"), staging=True,
+        staging_token="secret-token-abc",
+    )
+
+    assert captured["staging_token"] == "secret-token-abc"
 
 
 def test_run_in_sandbox_switches_to_the_chromium_image_only_for_staging(monkeypatch):

@@ -26,6 +26,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
@@ -240,6 +241,135 @@ class TwentyClient:
         )
         records = _extract_records(payload, object_name_plural)
         return records[0] if records else {}
+
+    # -- files ---------------------------------------------------------------
+    #: These two mutations live on the metadata GraphQL schema (like
+    #: ``_OBJECTS_QUERY``, not the core one), because their resolvers are
+    #: decorated ``@MetadataResolver()`` server-side — posting them to
+    #: ``/graphql`` instead answers "Cannot query field" and looks like a typo
+    #: in the mutation name rather than the wrong endpoint.
+    _CREATE_FILE_UPLOAD_MUTATION = """
+    mutation CreateFileUpload(
+      $filename: String!
+      $size: Float!
+      $fileFolder: FileFolder!
+      $fieldMetadataId: String
+    ) {
+      createFileUpload(
+        filename: $filename
+        size: $size
+        fileFolder: $fileFolder
+        fieldMetadataId: $fieldMetadataId
+      ) {
+        fileId uploadUrl contentType
+      }
+    }
+    """
+
+    _COMPLETE_FILE_UPLOAD_MUTATION = """
+    mutation CompleteFileUpload($fileId: String!) {
+      completeFileUpload(fileId: $fileId) { id path size url }
+    }
+    """
+
+    def attachment_file_field_id(self) -> str:
+        """The field-metadata id for ``attachments.file`` — required by
+        :meth:`upload_file`. Looked up fresh rather than hardcoded: it is a
+        per-workspace UUID, the same reason ``describe_objects`` never
+        hardcodes object/field names either."""
+        payload = self._request(
+            "POST",
+            "/metadata",
+            json_body={
+                "query": (
+                    "query { objects(paging: {first: 200}) { edges { node { "
+                    "nameSingular fields(paging: {first: 200}) { edges { node "
+                    "{ id name } } } } } } }"
+                )
+            },
+        )
+        edges = (payload.get("data") or {}).get("objects", {}).get("edges", [])
+        for edge in edges:
+            node = (edge or {}).get("node") or {}
+            if node.get("nameSingular") != "attachment":
+                continue
+            for field_edge in (node.get("fields") or {}).get("edges") or []:
+                field_node = (field_edge or {}).get("node") or {}
+                if field_node.get("name") == "file":
+                    return str(field_node.get("id") or "")
+        raise TwentyError("Could not find attachments.file's field metadata id")
+
+    def upload_file(
+        self, content: bytes, filename: str, field_metadata_id: str
+    ) -> dict:
+        """Upload one file and return the uploaded ``{id, path, size, url}``.
+
+        Three calls, matching what Twenty's own frontend does
+        (``useDirectFileUpload``): a metadata mutation to get a signed upload
+        target, a raw PUT of the bytes to that target, then a metadata
+        mutation to finalise it. The result's ``id`` is what a
+        ``file: [{"fileId": ..., "label": ...}]`` value on an ``attachments``
+        record needs.
+        """
+        create_payload = self._request(
+            "POST",
+            "/metadata",
+            json_body={
+                "query": self._CREATE_FILE_UPLOAD_MUTATION,
+                "variables": {
+                    "filename": filename,
+                    "size": len(content),
+                    "fileFolder": "FilesField",
+                    "fieldMetadataId": field_metadata_id,
+                },
+            },
+        )
+        errors = create_payload.get("errors") if isinstance(create_payload, dict) else None
+        if errors:
+            first = errors[0].get("message") if isinstance(errors[0], dict) else errors[0]
+            raise TwentyError(f"createFileUpload failed: {first}")
+        target = (create_payload.get("data") or {}).get("createFileUpload") or {}
+        upload_url = str(target.get("uploadUrl") or "")
+        content_type = str(target.get("contentType") or "application/octet-stream")
+        file_id = str(target.get("fileId") or "")
+        if not upload_url or not file_id:
+            raise TwentyError("createFileUpload returned no upload target")
+
+        # The server hands back its own configured public URL, which in this
+        # deployment names a different host:port than the one actually
+        # reachable from here — found live, uploading a real screenshot: the
+        # returned host 404s, the client's own configured base_url's host
+        # works against the exact same path+token. Swap the scheme+host, keep
+        # everything else (path, query, token) the server signed.
+        base_parts = urlsplit(self._base_url)
+        upload_parts = urlsplit(upload_url)
+        upload_url = urlunsplit(
+            (base_parts.scheme, base_parts.netloc, upload_parts.path,
+             upload_parts.query, upload_parts.fragment)
+        )
+
+        with httpx.Client(timeout=self._timeout, transport=self._transport) as http:
+            put_response = http.put(
+                upload_url, content=content, headers={"Content-Type": content_type}
+            )
+        if put_response.status_code >= 300:
+            raise TwentyError(
+                f"Uploading {filename} failed ({put_response.status_code})"
+            )
+
+        complete_payload = self._request(
+            "POST",
+            "/metadata",
+            json_body={
+                "query": self._COMPLETE_FILE_UPLOAD_MUTATION,
+                "variables": {"fileId": file_id},
+            },
+        )
+        errors = complete_payload.get("errors") if isinstance(complete_payload, dict) else None
+        if errors:
+            first = errors[0].get("message") if isinstance(errors[0], dict) else errors[0]
+            raise TwentyError(f"completeFileUpload failed: {first}")
+        return (complete_payload.get("data") or {}).get("completeFileUpload") or {}
 
     # -- metadata ----------------------------------------------------------
 

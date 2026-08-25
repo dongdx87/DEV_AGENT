@@ -52,6 +52,70 @@ class StagingGrant:
     worktrees: dict[str, Path]
 
 
+@dataclass(frozen=True)
+class ActiveStaging:
+    """The one run currently holding a live token, if any."""
+
+    run_id: str
+    issue_key: str
+
+
+def active() -> ActiveStaging | None:
+    """The run holding a live token right now, or ``None``.
+
+    Staging is a single shared environment — at most one run may deploy to it
+    at a time. ``pipeline.run_issue`` checks this before minting a second
+    token so two tickets can never rsync over each other's in-flight deploy.
+    """
+    session = SessionLocal()
+    try:
+        row = (
+            session.query(BloyStagingToken)
+            .filter(
+                BloyStagingToken.revoked_at.is_(None),
+                BloyStagingToken.expires_at > _now(),
+            )
+            .first()
+        )
+        return ActiveStaging(run_id=row.run_id, issue_key=row.issue_key) if row else None
+    except Exception:  # noqa: BLE001 — an unreadable check must not crash a run
+        logger.exception("bloy_dev_agent: could not check for an active staging token")
+        return None
+    finally:
+        session.close()
+
+
+def revoke_all_active() -> int:
+    """Revoke every still-active token — called once at service boot.
+
+    Only this service ever runs a pass, and only one at a time, so any token
+    still "active" when the process starts belongs to a run a killed process
+    never got to finish — the same reasoning as ``store.reap_stale_runs``.
+    Returns how many rows were revoked.
+    """
+    session = SessionLocal()
+    try:
+        rows = (
+            session.query(BloyStagingToken)
+            .filter(BloyStagingToken.revoked_at.is_(None))
+            .all()
+        )
+        for row in rows:
+            row.revoked_at = _now()
+        session.commit()
+        if rows:
+            logger.warning(
+                "bloy_dev_agent: revoked %d stale staging token(s) at boot", len(rows)
+            )
+        return len(rows)
+    except Exception:  # noqa: BLE001
+        session.rollback()
+        logger.exception("bloy_dev_agent: could not revoke active staging tokens at boot")
+        return 0
+    finally:
+        session.close()
+
+
 def mint(
     run_id: str, *, issue_key: str, worktrees: dict[str, Path], ttl_minutes: int
 ) -> str:

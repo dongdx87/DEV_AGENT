@@ -215,8 +215,42 @@ def check_repos(monorepo: Path, repos: tuple[str, ...]) -> Step:
     return Step(
         "repos", "Repo BLOY", FAIL, "Thiếu: " + ", ".join(missing),
         fix="clone_repos", fix_label="Clone repo còn thiếu",
-        why="Agent tách worktree từ bản clone trên máy — đó là cách code vào "
-            "container mà không phải đưa khoá SSH vào đó.",
+        why="Sandbox đọc CLAUDE.md và các repo anh em từ đây (chỉ đọc, mount "
+            "read-only) — không phải nơi worktree được tách ra (xem "
+            "'Mirror độc lập cho agent' bên dưới).",
+    )
+
+
+def check_agent_repos_mirror(agent_repos_root: Path, repos: tuple[str, ...]) -> Step:
+    """A separate clone the agent branches from — never the developer's own
+    checkout. See workspace.default_agent_repos_root's docstring: without
+    this, prepare() ran `git fetch`/`git worktree add` *inside* whatever
+    checkout happened to be at monorepo/repo, coupling an unattended run to
+    the developer's own working copy (shared .git object store, and a fetch
+    that silently mutates that checkout's own remote-tracking ref).
+    """
+    if not agent_repos_root.is_dir():
+        return Step(
+            "agent_repos_mirror", "Mirror độc lập cho agent", FAIL,
+            f"Không có thư mục {agent_repos_root}.",
+            fix="clone_agent_repos_mirror", fix_label="Clone mirror độc lập",
+            why="Không có mirror, agent tạm dùng bản checkout cá nhân trên máy "
+                "để tách worktree — vẫn chạy được, nhưng ghép chung .git object "
+                "store với đúng cái bạn đang code tay.",
+        )
+    missing = [name for name in repos if not (agent_repos_root / name / ".git").exists()]
+    if not missing:
+        return Step(
+            "agent_repos_mirror", "Mirror độc lập cho agent", OK,
+            f"{len(repos)}/{len(repos)} repo có mirror riêng, tách khỏi checkout cá nhân",
+        )
+    return Step(
+        "agent_repos_mirror", "Mirror độc lập cho agent", FAIL,
+        "Thiếu mirror cho: " + ", ".join(missing),
+        fix="clone_agent_repos_mirror", fix_label="Clone mirror độc lập",
+        why="Không có mirror, agent tạm dùng bản checkout cá nhân trên máy để "
+            "tách worktree — vẫn chạy được, nhưng ghép chung .git object store "
+            "với đúng cái bạn đang code tay.",
     )
 
 
@@ -446,6 +480,12 @@ def clone_repos(monorepo: Path, repos: tuple[str, ...], remote_prefix: str) -> s
     return "; ".join(parts) or "Không có repo nào cần clone"
 
 
+#: clone_repos() only cares that its first argument is a directory to clone
+#: `<name>.git` into per entry in `repos` — reusing it for the independent
+#: mirror avoids a near-duplicate clone loop.
+clone_agent_repos_mirror = clone_repos
+
+
 #: Actions the HTTP layer may invoke, by name. A fixed table rather than a
 #: lookup by attribute, so a crafted key can never reach an arbitrary callable.
 FIXES = {
@@ -453,6 +493,7 @@ FIXES = {
     "write_egress_mode",
     "start_sandbox_server",
     "clone_repos",
+    "clone_agent_repos_mirror",
 }
 
 
@@ -465,6 +506,8 @@ def diagnose(
     twenty_key: str,
     skill_packs_root: Path | None = None,
     monorepo_mirror: Path | None = None,
+    shopify_auth_dir: Path | None = None,
+    agent_repos_root: Path | None = None,
     include_staging: bool = False,
 ) -> list[Step]:
     """Run every check, converting a crash into a reportable failure."""
@@ -481,12 +524,31 @@ def diagnose(
         # monorepo (see its module docstring) — a sibling directory, so it
         # needs its own entry in the allowlist.
         required.append(str(monorepo_mirror))
+    if shopify_auth_dir is not None:
+        # A ticket touching the cms repo activates staging-verify with no
+        # marker and no approval step (see mapping.touches_ui_repo) — so
+        # this path being missing from the allowlist is a silent failure
+        # waiting to happen on the very next such ticket, not a hypothetical.
+        required.append(str(shopify_auth_dir))
+    if agent_repos_root is not None:
+        # workspace.prepare() branches every worktree from here whenever the
+        # mirror exists, and the resulting worktree's ``.git`` file is a
+        # pointer straight back to this absolute host path — sandbox_runner
+        # mounts it at the identical path for exactly that reason (see its
+        # own _volumes() comment). Missing from the allowlist meant every
+        # git command run from inside such a worktree failed outright; found
+        # live on a real run, not hypothetical like the comment above reads.
+        required.append(str(agent_repos_root))
     probes = [
         lambda: check_docker(),
         lambda: check_sandbox_config(required),
         lambda: check_sandbox_server(),
         lambda: check_worktree_root(worktree_root),
         lambda: check_repos(monorepo, repos),
+    ]
+    if agent_repos_root is not None:
+        probes.append(lambda: check_agent_repos_mirror(agent_repos_root, repos))
+    probes += [
         lambda: check_claude_cli(),
         lambda: check_claude_login(),
         lambda: check_git_ssh(monorepo, repos),

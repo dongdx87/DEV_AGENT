@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -34,6 +35,17 @@ LOG_DIR_NAME = ".bloy-logs"
 #: same reason agent_team's own task workspaces are inspectable directories,
 #: not something thrown away at the end of a run.
 SKILLS_DIR_NAME = ".bloy-skills"
+
+#: Same idea again, for staging-verify screenshots. One subfolder per run, so
+#: a run's images survive the sandbox container's death and sit where a human
+#: (or the run's detail page) can go look at them afterward.
+ARTIFACTS_DIR_NAME = ".bloy-artifacts"
+
+#: A staging-verify screenshot's only valid name. Checked BEFORE any path is
+#: ever joined with it — matches this codebase's rule elsewhere (see
+#: staging_control/apps.py) that a caller-influenced string must never reach a
+#: filesystem path unchecked. No extension games, no directory separators.
+ARTIFACT_NAME = re.compile(r"^[A-Za-z0-9_-]+\.png$")
 
 KIND_THINKING = "thinking"
 KIND_TEXT = "text"
@@ -73,6 +85,34 @@ def host_skills_dir(worktree_root: Path, run_id: str) -> Path:
 def container_skills_dir(mount: str, run_id: str) -> str:
     """The same directory as the container sees it."""
     return f"{mount}/{SKILLS_DIR_NAME}/{run_id}"
+
+
+def host_artifacts_dir(worktree_root: Path, run_id: str) -> Path:
+    """Where the host (and the run's detail page) can find a run's screenshots."""
+    return worktree_root / ARTIFACTS_DIR_NAME / run_id
+
+
+def container_artifacts_dir(mount: str, run_id: str) -> str:
+    """The same directory as the container sees it — where the prompt tells
+    the agent to save screenshots. Already inside the read-write worktree
+    mount, so nothing new needs to be mounted for this to work."""
+    return f"{mount}/{ARTIFACTS_DIR_NAME}/{run_id}"
+
+
+def list_artifacts(worktree_root: Path, run_id: str) -> list[str]:
+    """Screenshot filenames for one run, whitelisted and sorted.
+
+    A run with no staging-verify (or one that skipped it) simply has no
+    directory here — that is the normal case, not an error.
+    """
+    directory = host_artifacts_dir(worktree_root, run_id)
+    if not directory.is_dir():
+        return []
+    return sorted(
+        entry.name
+        for entry in directory.iterdir()
+        if entry.is_file() and ARTIFACT_NAME.match(entry.name)
+    )
 
 
 def _tool_summary(block: dict) -> str:

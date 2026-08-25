@@ -269,6 +269,12 @@ def _update(run_id: str, **fields) -> None:
     try:
         run = session.get(BloyPipelineRun, run_id)
         if run is None:
+            logger.warning(
+                "bloy_dev_agent: run %s has no row to update (fields=%s) — "
+                "its start_run insert was likely lost; this run's bookkeeping "
+                "is now incomplete",
+                run_id, sorted(fields),
+            )
             return
         for key, value in fields.items():
             if value is not None or key in {"stage", "detail"}:

@@ -246,6 +246,117 @@ def test_describe_objects_surfaces_graphql_errors():
     assert "permission denied" in excinfo.value.message
 
 
+def test_attachment_file_field_id_finds_the_files_field():
+    payload = {
+        "data": {
+            "objects": {
+                "edges": [
+                    {
+                        "node": {
+                            "nameSingular": "issue",
+                            "fields": {"edges": [{"node": {"id": "wrong", "name": "file"}}]},
+                        }
+                    },
+                    {
+                        "node": {
+                            "nameSingular": "attachment",
+                            "fields": {
+                                "edges": [
+                                    {"node": {"id": "not-it", "name": "name"}},
+                                    {"node": {"id": "field-xyz", "name": "file"}},
+                                ]
+                            },
+                        }
+                    },
+                ]
+            }
+        }
+    }
+    client = make_client(lambda request: httpx.Response(200, json=payload))
+    assert client.attachment_file_field_id() == "field-xyz"
+
+
+def test_attachment_file_field_id_raises_when_not_found():
+    client = make_client(
+        lambda request: httpx.Response(200, json={"data": {"objects": {"edges": []}}})
+    )
+    with pytest.raises(TwentyError):
+        client.attachment_file_field_id()
+
+
+def test_upload_file_rewrites_the_servers_own_host_to_the_configured_base(monkeypatch):
+    """Live bug: this deployment's server hands back an upload URL naming a
+    host:port that 404s from here, while the exact same path+token against
+    the client's own configured base_url works. Pin the rewrite so a future
+    change can't silently drop it and reintroduce the 404."""
+    seen_put_url = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/metadata":
+            body = request.content.decode()
+            if "CreateFileUpload" in body:
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": {
+                            "createFileUpload": {
+                                "fileId": "file-1",
+                                "uploadUrl": "http://totally-unreachable-host:9999"
+                                "/file-upload/file-1?token=abc",
+                                "contentType": "application/octet-stream",
+                            }
+                        }
+                    },
+                )
+            if "CompleteFileUpload" in body:
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": {
+                            "completeFileUpload": {
+                                "id": "file-1",
+                                "path": "files-field/x/file-1.png",
+                                "size": 5,
+                                "url": f"{BASE_URL}/file/files-field/file-1?token=abc",
+                            }
+                        }
+                    },
+                )
+        if request.url.path == "/file-upload/file-1":
+            seen_put_url["url"] = str(request.url)
+            return httpx.Response(204)
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    client = make_client(handler)
+    result = client.upload_file(b"hello", "shot.png", "field-xyz")
+
+    assert seen_put_url["url"].startswith(BASE_URL)
+    assert "totally-unreachable-host" not in seen_put_url["url"]
+    assert result["id"] == "file-1"
+
+
+def test_upload_file_surfaces_a_failed_upload_as_a_twenty_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "CreateFileUpload" in request.content.decode():
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "createFileUpload": {
+                            "fileId": "file-1",
+                            "uploadUrl": f"{BASE_URL}/file-upload/file-1?token=abc",
+                            "contentType": "application/octet-stream",
+                        }
+                    }
+                },
+            )
+        return httpx.Response(500, text="storage is down")
+
+    client = make_client(handler)
+    with pytest.raises(TwentyError):
+        client.upload_file(b"hello", "shot.png", "field-xyz")
+
+
 def test_record_url_uses_the_show_page_path():
     client = make_client(lambda request: httpx.Response(200, json={}))
     assert (
@@ -340,6 +451,201 @@ def test_the_prompt_is_not_indented_like_a_code_block():
     assert framing, "framing lines should be present"
     for line in framing:
         assert not line.startswith(" "), f"indented framing line: {line!r}"
+
+
+# ---------------------------------------------------------------------------
+# is_snippet_deliverable: agent's own self-declared heading, never ticket text
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "output, expected",
+    [
+        ("DELIVERABLE: SNIPPET", True),
+        ("some analysis\n\nDELIVERABLE: SNIPPET", True),
+        ("some analysis\n\nDELIVERABLE: SNIPPET\n\nmore text after", True),
+        ("## DELIVERABLE: SNIPPET", True),
+        ("deliverable: snippet", True),  # case-insensitive
+        ("  DELIVERABLE: SNIPPET  ", True),  # trailing/leading whitespace on the line
+        ("", False),
+        ("   ", False),
+        # Buried mid-paragraph, not a real declaration on its own line.
+        ("I considered a DELIVERABLE: SNIPPET approach but rejected it.", False),
+        # The old ticket-body marker text, now meaningless — must not be
+        # mistaken for the new output-side heading if the agent quotes it back.
+        ("The ticket said deliverable: snippet, but I implemented it for real.", False),
+        # Discussing the heading without declaring it.
+        ('If needed I would end with "DELIVERABLE: SNIPPET" but that is not the case here.', False),
+    ],
+)
+def test_is_snippet_deliverable_requires_a_real_standalone_heading(output, expected):
+    from bloy_dev_agent.features.twenty import mapping
+
+    assert mapping.is_snippet_deliverable(output) is expected
+
+
+@pytest.mark.parametrize(
+    "output, expected",
+    [
+        ("DELIVERABLE: NO CHANGE NEEDED", True),
+        ("some analysis\n\nDELIVERABLE: NO CHANGE NEEDED", True),
+        ("## DELIVERABLE: NO CHANGE NEEDED", True),
+        ("deliverable: no change needed", True),  # case-insensitive
+        ("DELIVERABLE:  NO  CHANGE  NEEDED", True),  # extra internal whitespace
+        ("", False),
+        # Must not cross-match the sibling heading or vice versa.
+        ("DELIVERABLE: SNIPPET", False),
+        ("I decided no change is needed here, but did not use the heading.", False),
+    ],
+)
+def test_is_no_change_needed_requires_a_real_standalone_heading(output, expected):
+    from bloy_dev_agent.features.twenty import mapping
+
+    assert mapping.is_no_change_needed(output) is expected
+    # The two headings are found live to be genuinely distinct outcomes —
+    # never let one heading's regex accidentally match the other's text.
+    if expected:
+        assert mapping.is_snippet_deliverable(output) is False
+
+
+# ---------------------------------------------------------------------------
+# Staging-verify: touches_ui_repo, and build_prompt's staging block
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "repos, expected",
+    [
+        (["shopify-app-loyalty-cms"], True),
+        (["shopify-app-loyalty-api", "shopify-app-loyalty-cms"], True),
+        (["shopify-app-loyalty-api"], False),
+        ([], False),
+    ],
+)
+def test_touches_ui_repo_only_true_for_a_ui_capable_repo(repos, expected):
+    from bloy_dev_agent.features.twenty import mapping
+
+    assert mapping.touches_ui_repo(repos) is expected
+
+
+def _sample_issue():
+    from bloy_dev_agent.features.twenty import mapping
+
+    return mapping.normalize_issue(
+        {
+            "id": "x",
+            "issueKey": "BLOY-9",
+            "title": "BLS-9001: Fix a thing",
+            "description": "Do the thing",
+        }
+    )
+
+
+def test_build_prompt_without_staging_never_mentions_it():
+    """The default call (no staging=, or staging=None) must be exactly what
+    every ticket got before this feature existed — no trace of the staging
+    block anywhere in the output."""
+    from bloy_dev_agent.features.twenty import mapping
+
+    issue = _sample_issue()
+    default_call = mapping.build_prompt(
+        issue, "/worktrees/x", implement=True, monorepo="/monorepo"
+    )
+    explicit_none = mapping.build_prompt(
+        issue, "/worktrees/x", implement=True, monorepo="/monorepo", staging=None
+    )
+
+    assert default_call == explicit_none
+    for marker in ("Staging verify", "ĐÃ VERIFY TRÊN STAGING", "BLOY_STAGING_TOKEN"):
+        assert marker not in default_call
+
+
+def test_build_prompt_with_staging_appends_without_disturbing_the_rest():
+    """The staging block must be a pure addition at the end — the part every
+    ordinary ticket already gets must come through completely unchanged."""
+    from bloy_dev_agent.features.twenty import mapping
+
+    issue = _sample_issue()
+    without_staging = mapping.build_prompt(
+        issue, "/worktrees/x", implement=True, monorepo="/monorepo"
+    )
+    with_staging = mapping.build_prompt(
+        issue, "/worktrees/x", implement=True, monorepo="/monorepo",
+        staging=mapping.StagingContext(
+            control_base_url="https://staging-control.example",
+            artifacts_dir="/worktrees/.bloy-artifacts/run-1",
+        ),
+    )
+
+    assert with_staging.startswith(without_staging)
+    added = with_staging[len(without_staging):]
+    assert "https://staging-control.example/v1/deploy" in added
+    assert "/worktrees/.bloy-artifacts/run-1" in added
+    assert "ĐÃ VERIFY TRÊN STAGING" in added
+    assert "BLOY_STAGING_TOKEN" in added
+
+
+def test_build_prompt_staging_block_tells_the_agent_it_may_skip_verification():
+    """The agent must judge for itself whether its change is UI-visible — a
+    logic-only change inside a UI-capable repo is a legitimate reason to skip
+    deploy+screenshot, not a failure."""
+    from bloy_dev_agent.features.twenty import mapping
+
+    prompt = mapping.build_prompt(
+        _sample_issue(), "/worktrees/x", implement=True, monorepo="/monorepo",
+        staging=mapping.StagingContext(
+            control_base_url="https://staging-control.example",
+            artifacts_dir="/worktrees/.bloy-artifacts/run-1",
+        ),
+    )
+
+    assert "Decide for yourself" in prompt
+    assert "correct outcome, not a failure" in prompt
+
+
+def test_build_prompt_omits_storefront_section_when_blank():
+    """storefront_url="" (the default) must add nothing — graceful absence,
+    same pattern as skill_packs_root/monorepo_mirror elsewhere."""
+    from bloy_dev_agent.features.twenty import mapping
+
+    prompt = mapping.build_prompt(
+        _sample_issue(), "/worktrees/x", implement=True, monorepo="/monorepo",
+        staging=mapping.StagingContext(
+            control_base_url="https://staging-control.example",
+            artifacts_dir="/worktrees/.bloy-artifacts/run-1",
+        ),
+    )
+
+    assert "Storefront verify" not in prompt
+
+
+def test_build_prompt_appends_storefront_section_when_configured():
+    from bloy_dev_agent.features.twenty import mapping
+
+    issue = _sample_issue()
+    without_storefront = mapping.build_prompt(
+        issue, "/worktrees/x", implement=True, monorepo="/monorepo",
+        staging=mapping.StagingContext(
+            control_base_url="https://staging-control.example",
+            artifacts_dir="/worktrees/.bloy-artifacts/run-1",
+        ),
+    )
+    with_storefront = mapping.build_prompt(
+        issue, "/worktrees/x", implement=True, monorepo="/monorepo",
+        staging=mapping.StagingContext(
+            control_base_url="https://staging-control.example",
+            artifacts_dir="/worktrees/.bloy-artifacts/run-1",
+            storefront_url="https://test-bloy-loyalty.myshopify.com",
+            storefront_password="1",
+        ),
+    )
+
+    assert with_storefront.startswith(without_storefront)
+    added = with_storefront[len(without_storefront):]
+    assert "https://test-bloy-loyalty.myshopify.com" in added
+    assert "`1`" in added
+    assert "/worktrees/.bloy-artifacts/run-1" in added
+    assert "NOT a real credential" in added
 
 
 # ---------------------------------------------------------------------------

@@ -1,72 +1,49 @@
 # BLOY Dev Agent
 
 An [agent-manager](https://github.com/BSSCommerce/agent-manager) **community
-plugin** that lets BLOY development tasks flow from **Twenty** onto an
-**Agent Team** board, where agents pick them up, implement them in an isolated
-sandbox, and produce a verified merge request.
+plugin** that pulls BLOY development tickets straight from **Twenty**, writes
+the code itself in an isolated sandbox, and opens a verified GitLab merge
+request — no board, no other plugin involved.
 
-> This plugin deliberately owns very little. Boards, per-task sandboxes,
-> planning contracts, verification receipts, the cockpit and Mattermost
-> notifications all come from the `agent_team` plugin. What lives here is the
-> Twenty connection, BLOY-specific agent capabilities, and the glue.
+> **Setup guide (dev + production, step by step): [SETUP.md](SETUP.md).**
+> This file stays a short overview; SETUP.md is what a new machine should
+> actually follow.
 
----
+Runs as its own **standalone service**, on its own port, with its own SQLite
+database — deliberately separate from BAM's own process. See
+[SETUP.md § 0](SETUP.md#0-kiến-trúc-tóm-tắt) for why: while the pipeline used
+to live inside BAM, restarting BAM killed whatever run was in flight.
+`plugin.py` is a thin shim inside BAM — a sidebar link plus a "run a pass" HTTP
+trigger — and imports nothing from the real pipeline, so BAM stays loadable
+even when this service is down.
 
 ## Scope
 
 | | |
 |---|---|
-| **Does** | Sync Twenty ↔ Agent Team board · Shopify session capture for agents · BLOY skill pack · its own settings and status pages |
-| **Does not** | Run agents · manage sandboxes · provide a board or cockpit · alter another plugin's tables · modify agent-manager core |
-
-Two rules keep that boundary real:
-
-1. **One door to `agent_team`.** Only `features/bridge/agent_team.py` may import
-   or call it. `tests/` enforces this.
-2. **Own tables only.** Migrations here create `plugin_bloy_*` tables. The
-   Twenty ↔ task relation lives in a link table rather than as extra columns on
-   the Agent Team task row, so either side can be upgraded or removed cleanly.
+| **Does** | Sync Twenty ↔ its own pipeline · runs agents in per-ticket sandboxes · Shopify staging-verify (screenshots on a real store) · its own skill-pack selection, settings and status pages |
+| **Does not** | Depend on `agent_team` or any other plugin · alter another plugin's tables · require BAM to be up to keep a run alive |
 
 ## Install (development)
 
-From the agent-manager project root:
+See [SETUP.md](SETUP.md) for the full walkthrough (Docker, OpenSandbox,
+Claude CLI, GitLab SSH, Twenty credentials). Short version:
 
 ```bash
-ln -s /path/to/bloy_dev_agent community_plugins/bloy_dev_agent
-uv run agent-manager
+ln -s /path/to/bloy_dev_agent community_plugins/bloy_dev_agent   # from agent-manager root
+cd agent-manager && uv sync && uv run setup-dependencies
+PYTHONPATH=community_plugins uv run python -m bloy_dev_agent.service
 ```
 
-`PLUGINS_EXTERNAL_DIR=community_plugins` must be set in `.env`. The core
-migration runner applies `db_migrations/*.sql` on startup; the plugin then
-appears on the **Plugins** page and in the sidebar.
-
 The folder name matters: it becomes the Python package name (underscores, not
-hyphens), and plugins load in alphabetical order — a name sorting before
-`agent_team` would break a declared dependency on it.
+hyphens). Open `http://localhost:8100/setup` and follow the wizard.
 
 ## Preflight
 
-The landing page (`/bloy-dev-agent`) runs its checks against the live process
-rather than trusting the design document: whether `agent_team` is installed and
-enabled, which of its `services()` are exposed, whether the direct-import
-fallback works, whether this plugin's table exists, whether the routine
-scheduler is available, and whether Twenty credentials are configured.
-
-Same data as JSON at `/bloy-dev-agent/api/preflight`.
-
-## Bridging to `agent_team`
-
-Two channels, preferred order:
-
-1. `PluginRegistry.get_service("agent_team", key)` — the supported cross-plugin
-   channel; returns `None` when the plugin is absent or disabled.
-2. Direct import of `agent_team.*` — works only because the loader puts
-   `community_plugins/` on `sys.path`, and reaches into another plugin's
-   internals.
-
-`agent_team` does not override `services()` yet, so channel 2 is what runs
-today. Once it exposes `create_task`, `update_task`, `get_task_state` and
-`post_comment`, the fallback branch can be deleted and nothing else changes.
+`/preflight` (and `/api/preflight` as JSON) runs every setup check against the
+live process — Docker, OpenSandbox config and server, the monorepo and its
+agent-only mirror, Claude CLI/login, GitLab SSH, Twenty credentials, egress
+mode. Same checklist SETUP.md walks through by hand.
 
 ## Configuration
 
@@ -74,6 +51,39 @@ today. Once it exposes `create_task`, `update_task`, `get_task_state` and
 |---|---|
 | `BLOY_TWENTY_BASE_URL` | Twenty API base URL |
 | `BLOY_TWENTY_API_KEY` | API key bound to a narrow role and a dedicated bot workspace member |
+
+## Staging-verify
+
+When a ticket touches `shopify-app-loyalty-cms`, the pipeline automatically
+gives the sandbox a real staging deploy target and a headless Chromium (via
+Playwright MCP) so it can look at the real Shopify Admin embedded app after
+deploying — no marker in the ticket, no approval step; the agent decides for
+itself whether its change is worth verifying.
+
+For the agent to actually reach a *logged-in* Shopify Admin, a human has to
+capture a browser session once, on a real display (Shopify's 2FA and its
+bot-check interstitial both need a person — a headless sandbox has neither):
+
+1. On a machine with a real screen, run a plain Playwright script (or reuse
+   the `shopify-screenshot` skill's own headed-Chrome login flow) and log
+   into the "testsite 1" store's Shopify Admin as you normally would.
+2. Before closing the browser, export the session:
+   ```js
+   await context.storageState({
+     path: `${process.env.HOME}/.bloy-shopify-auth/storage-state.json`,
+   });
+   ```
+3. `chmod 600 ~/.bloy-shopify-auth/storage-state.json` — it holds live
+   session cookies, not a password, but it is still a real credential.
+
+The sandbox only ever receives this file (mounted read-only) — never the
+plaintext password. If the file is missing or the session has expired, a run
+simply reports that it could not verify and moves on; it never fails the
+ticket over this.
+
+**Refresh cadence:** whenever a staging-verify run's report stops showing
+"ĐÃ VERIFY TRÊN STAGING" and instead notes it hit a login wall, repeat the
+steps above.
 
 ## Development
 
@@ -83,10 +93,9 @@ PYTHONPATH=community_plugins uv run pytest community_plugins/bloy_dev_agent/test
 uv run ruff check community_plugins/bloy_dev_agent
 ```
 
-Never edit a migration that has already been applied — the runner stores a
-checksum per file and will refuse the change. Add a new file instead.
-
-## Status
-
-Skeleton: plugin registration, own table, bridge probe, preflight page.
-Twenty sync, write-back and the Shopify session vault are not implemented yet.
+The service owns its schema directly through SQLAlchemy (`db.py`'s
+`init_db()`) — there is no `db_migrations/*.sql` here and nothing runs through
+BAM's migration runner, on purpose: sharing BAM's database would tie this
+service's uptime to BAM's, exactly what running standalone avoids. The SQLite
+file defaults to `bloy_dev_agent/db/bloy_dev_agent.sqlite3`, overridable with
+`BLOY_AGENT_DB_URL`.

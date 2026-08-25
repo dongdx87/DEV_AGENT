@@ -37,6 +37,15 @@ def client(monkeypatch, tmp_path):
     importlib.reload(models)
     importlib.reload(store)
 
+    # staging_control.tokens imported its own SessionLocal from db at whatever
+    # point it was first loaded (often via pipeline.py, well before this
+    # fixture runs) — reloading db above does not update that binding, so
+    # _reap_on_boot's revoke_all_active() would otherwise reach the real
+    # database instead of this test's throwaway one.
+    from bloy_dev_agent.staging_control import tokens as staging_tokens_module
+
+    importlib.reload(staging_tokens_module)
+
     from bloy_dev_agent import service
 
     importlib.reload(service)
@@ -153,6 +162,91 @@ def test_run_detail_shows_the_agent_reasoning(client, tmp_path):
 
     assert "AI thinking" in text
     assert "đọc CLAUDE.md" in text
+
+
+def test_run_detail_shows_a_staging_verify_screenshot_gallery(client, tmp_path, monkeypatch):
+    app, store = client
+    from bloy_dev_agent import service
+    from bloy_dev_agent.features import agent_log
+
+    monkeypatch.setattr(service.workspace, "default_worktree_root", lambda: tmp_path)
+    run_id = store.start_run(
+        issue_id="i-9", issue_key="BLOY-9", project_id="p-1", attempt=1
+    )
+    artifacts_dir = agent_log.host_artifacts_dir(tmp_path, run_id)
+    artifacts_dir.mkdir(parents=True)
+    (artifacts_dir / "before.png").write_bytes(b"\x89PNG")
+
+    text = app.get(f"/runs/{run_id}").text
+
+    assert f"/runs/{run_id}/artifacts/before.png" in text
+
+
+def test_run_detail_shows_nothing_extra_when_there_is_no_artifact(client, tmp_path, monkeypatch):
+    """The common case — no staging-verify ran — must not grow the page."""
+    app, store = client
+    from bloy_dev_agent import service
+
+    monkeypatch.setattr(service.workspace, "default_worktree_root", lambda: tmp_path)
+    run_id = store.start_run(
+        issue_id="i-10", issue_key="BLOY-10", project_id="p-1", attempt=1
+    )
+
+    text = app.get(f"/runs/{run_id}").text
+
+    assert "/artifacts/" not in text
+
+
+def test_a_real_artifact_is_served_as_a_png(client, tmp_path, monkeypatch):
+    app, store = client
+    from bloy_dev_agent import service
+    from bloy_dev_agent.features import agent_log
+
+    monkeypatch.setattr(service.workspace, "default_worktree_root", lambda: tmp_path)
+    run_id = store.start_run(
+        issue_id="i-11", issue_key="BLOY-11", project_id="p-1", attempt=1
+    )
+    artifacts_dir = agent_log.host_artifacts_dir(tmp_path, run_id)
+    artifacts_dir.mkdir(parents=True)
+    (artifacts_dir / "after.png").write_bytes(b"\x89PNG\r\n")
+
+    response = app.get(f"/runs/{run_id}/artifacts/after.png")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/png"
+    assert response.content == b"\x89PNG\r\n"
+
+
+def test_an_unknown_artifact_is_a_404_not_an_error(client, tmp_path, monkeypatch):
+    app, store = client
+    from bloy_dev_agent import service
+
+    monkeypatch.setattr(service.workspace, "default_worktree_root", lambda: tmp_path)
+    run_id = store.start_run(
+        issue_id="i-12", issue_key="BLOY-12", project_id="p-1", attempt=1
+    )
+
+    response = app.get(f"/runs/{run_id}/artifacts/nope.png")
+
+    assert response.status_code == 404
+
+
+@pytest.mark.parametrize(
+    "filename",
+    ["../secret.png", "..%2Fsecret.png", "shot.png.jpg", "shot.svg", "sub/shot.png"],
+)
+def test_a_malformed_filename_is_rejected_before_any_path_join(client, filename):
+    """Never join a caller-influenced string into a path unchecked — the
+    regex must run first, matching staging_control/apps.py's own discipline.
+    """
+    app, store = client
+    run_id = store.start_run(
+        issue_id="i-13", issue_key="BLOY-13", project_id="p-1", attempt=1
+    )
+
+    response = app.get(f"/runs/{run_id}/artifacts/{filename}", follow_redirects=False)
+
+    assert response.status_code in (400, 404)
 
 
 def test_run_detail_redirects_for_an_unknown_run(client):

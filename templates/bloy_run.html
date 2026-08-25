@@ -132,6 +132,23 @@
   </section>
   {% endif %}
 
+  {# ---------- staging-verify screenshots ---------- #}
+  {% if artifacts %}
+  <section class="rounded-2xl border border-slate-200 bg-white shadow-sm">
+    <div class="px-5 py-4 border-b border-slate-200">
+      <h2 class="text-base font-semibold text-slate-900">Ảnh chụp staging</h2>
+    </div>
+    <div class="grid grid-cols-2 gap-3 p-5 sm:grid-cols-3">
+      {% for name in artifacts %}
+      <a href="/runs/{{ run.id }}/artifacts/{{ name }}" target="_blank">
+        <img src="/runs/{{ run.id }}/artifacts/{{ name }}" alt="{{ name }}"
+             class="w-full rounded-lg border border-slate-200">
+      </a>
+      {% endfor %}
+    </div>
+  </section>
+  {% endif %}
+
   {% if run.sandbox_id %}
   <p class="text-xs text-slate-400">Sandbox <span class="font-mono">{{ run.sandbox_id }}</span></p>
   {% endif %}

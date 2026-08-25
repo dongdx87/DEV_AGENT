@@ -32,6 +32,7 @@ from bloy_dev_agent.features import agent_log, sandbox_runner, skill_packs, work
 from bloy_dev_agent.features.twenty import mapping
 from bloy_dev_agent.features.twenty.client import TwentyClient, TwentyError
 from bloy_dev_agent.models import BloyPipelineRun
+from bloy_dev_agent.staging_control import tokens as staging_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +45,40 @@ def default_monorepo() -> Path:
     ``BLOY_DEV_AGENT/.env``, so a plain constant would miss that file.
     """
     return Path(os.environ.get("BLOY_MONOREPO", "/home/bss-group/BLOY"))
+
+
+def default_staging_control_url() -> str:
+    """Base URL a sandbox uses to reach staging_control — the public tunnel
+    hostname, not the ``172.17.0.1`` bind address staging_control listens on
+    (that address is only reachable from inside a sandbox's own network
+    namespace via the host's iptables pinhole, never something to hand to the
+    agent as a URL to call). Same env-at-call-time reasoning as
+    :func:`default_monorepo`.
+    """
+    return os.environ.get(
+        "BLOY_STAGING_CONTROL_URL",
+        "https://dev-dongdx2k3-bloy-staging-control.dev-bsscommerce.com",
+    )
+
+
+def default_storefront_url() -> str:
+    """The real dev storefront a staging-verify run may open directly.
+
+    Password-gated but with none of the Admin session-cookie complexity (see
+    default_storefront_password) — a plain public dev-store gate, not a real
+    credential, so a fixed fallback here is fine unlike anything Admin-auth
+    related. Same env-at-call-time reasoning as default_monorepo.
+    """
+    return os.environ.get("BLOY_STOREFRONT_URL", "https://test-bloy-loyalty.myshopify.com")
+
+
+def default_storefront_password() -> str:
+    """The storefront password gate above — confirmed live to be a trivial,
+    static, non-secret string with no bot-detection at all (unlike
+    admin.shopify.com), so it is safe to hand to the agent directly in the
+    prompt rather than treating it like a real credential.
+    """
+    return os.environ.get("BLOY_STOREFRONT_PASSWORD", "1")
 
 
 DEFAULT_TARGET_REPO = "shopify-app-loyalty-api"
@@ -67,10 +102,12 @@ DEFAULT_BLOCKED_STATUS = "Backlog"
 #: the in-place sandbox-stage loop inside run_issue.
 DEFAULT_ERROR_STATUS = DEFAULT_BLOCKED_STATUS
 
-#: Temporary: paused because the bug above made every silent auto-retry post
-#: its own comment to Twenty ("spam"). Flip back to True once the fix above
-#: has been confirmed to actually stop the spam in production.
-COMMENTS_ENABLED = False
+#: Was paused because the bug above made every silent auto-retry post its own
+#: comment to Twenty ("spam"). The fix above (separating error_status from
+#: source_status, plus the in-place sandbox-stage retry that reuses one
+#: run_id) has since run clean across many real passes with no re-pickup and
+#: no spam — re-enabled so a reviewer actually sees why an issue moved.
+COMMENTS_ENABLED = True
 
 
 def project_id_of(record: dict) -> str:
@@ -185,25 +222,68 @@ def release_stranded_issues(
     return released
 
 
-def _comment(client: TwentyClient, issue_id: str, text: str) -> None:
+def _comment(client: TwentyClient, issue_id: str, text: str) -> str:
+    """Post the report; return the new comment's id, or "" if none was posted."""
     if not COMMENTS_ENABLED:
-        return
+        return ""
     try:
-        client.create_record(
+        record = client.create_record(
             "issueComments",
             {"issueId": issue_id, "bodyV2": mapping.text_to_blocknote(text)},
         )
+        return str(record.get("id") or "")
     except TwentyError as exc:
         logger.warning("bloy_dev_agent: could not comment on %s: %s", issue_id, exc.message)
+        return ""
+
+
+def _attach_screenshots(
+    client: TwentyClient,
+    issue_id: str,
+    comment_id: str,
+    worktree_root: Path,
+    run_id: str,
+) -> None:
+    """Upload whatever staging-verify screenshots this run actually saved.
+
+    Best-effort, like ``_comment``: a run that changed real code and got a
+    real merge request must never be reported as failed just because
+    attaching evidence afterward hit a transient error.
+    """
+    names = agent_log.list_artifacts(worktree_root, run_id)
+    if not names:
+        return
+    try:
+        field_id = client.attachment_file_field_id()
+    except TwentyError as exc:
+        logger.warning("bloy_dev_agent: could not find attachments.file field: %s", exc.message)
+        return
+    directory = agent_log.host_artifacts_dir(worktree_root, run_id)
+    for name in names:
+        try:
+            content = (directory / name).read_bytes()
+            uploaded = client.upload_file(content, name, field_id)
+            values = {"name": name, "targetIssueId": issue_id, "file": [
+                {"fileId": uploaded.get("id"), "label": name}
+            ]}
+            if comment_id:
+                values["targetIssueCommentId"] = comment_id
+            client.create_record("attachments", values)
+        except (OSError, TwentyError) as exc:
+            logger.warning(
+                "bloy_dev_agent: could not attach screenshot %s for run %s: %s",
+                name, run_id, exc,
+            )
 
 
 def _report(outcome: PipelineOutcome, issue_key: str, answer: str = "") -> str:
     """The comment a reviewer reads on the issue."""
     if outcome.advice and outcome.ok:
         return (
-            f"Dev Agent đã phân tích {issue_key}. Deliverable là đoạn code gửi dev "
-            f"dán vào theme khách — KHÔNG sửa code app, vì sửa app sẽ đổi cho mọi "
-            f"merchant.\n\n{answer}\n\nSandbox: {outcome.sandbox_id}"
+            f"Dev Agent đã phân tích {issue_key} — KHÔNG sửa code app. Có thể là "
+            f"đoạn code gửi dev dán vào theme khách (không đổi cho mọi merchant), "
+            f"hoặc ticket đã giải quyết được bằng tính năng có sẵn — xem chi tiết "
+            f"bên dưới.\n\n{answer}\n\nSandbox: {outcome.sandbox_id}"
         )
 
     if outcome.ok:
@@ -300,7 +380,10 @@ def run_issue(
             blocked=True,
             attempt=attempts.failed + 1,
         )
-        return _finish(client, issue, outcome, statuses, blocked_status or error_status)
+        return _finish(
+            client, issue, outcome, statuses, blocked_status or error_status,
+            worktree_root=worktree_root,
+        )
 
     attempt_no = attempts.failed + 1
     run_id = store.start_run(
@@ -339,6 +422,13 @@ def run_issue(
     # plumbing — only the prompt has to say they exist.
     store.set_stage(run_id, "worktree")
     repos = mapping.wanted_repos(issue, workspace.KNOWN_REPOS) or [target_repo]
+    # A structural fact (which repo this ticket will touch), never anything
+    # read out of the ticket's own text — see mapping.touches_ui_repo's own
+    # docstring for why a ticket body must never be able to grant its own
+    # sandbox network access and a deploy token. The finer judgment — does
+    # this SPECIFIC change actually affect the UI — is the agent's own call
+    # once it can see its diff; see mapping.STAGING_INSTRUCTIONS.
+    staging_requested = mapping.touches_ui_repo(repos)
     try:
         spaces = [
             workspace.prepare(
@@ -352,17 +442,65 @@ def run_issue(
             issue.key, False, stage="worktree", detail=str(exc),
             run_id=run_id, attempt=attempt_no, aborted=True,
         )
-        return _finish(client, issue, outcome, statuses, error_status)
+        return _finish(client, issue, outcome, statuses, error_status, worktree_root=worktree_root)
 
     # --- sandbox ----------------------------------------------------------
     # The prompt must name the path *inside* the container. Handing over the
     # host path sends the agent looking for a directory that does not exist
     # there, and it gives up in seconds without touching a file.
     store.set_stage(run_id, "sandbox", branch=space.branch)
-    advice = mapping.wants_advice(issue)
     workdirs = [
         sandbox_runner.container_path(s.path, worktree_root) for s in spaces
     ]
+
+    # Staging is one shared environment — at most one run may hold it at a
+    # time, so a second UI-touching ticket started while another is still
+    # deploying is refused outright rather than silently racing it. Checked
+    # here (not earlier) because it costs nothing before this point anyway,
+    # and refusing after the claim would strand the issue in "In Progress"
+    # were it checked any earlier than the stage that actually needs it.
+    staging_ctx: mapping.StagingContext | None = None
+    staging_token = ""
+    if staging_requested:
+        existing = staging_tokens.active()
+        if existing is not None and existing.run_id != run_id:
+            # aborted, not blocked: staging being busy is not this ticket's
+            # fault and must not burn one of its attempt-cap slots (only
+            # STATE_FAILED rows count there) — and "blocked" specifically
+            # means "attempt cap exhausted" in the report text, which would
+            # be a misleading message here.
+            outcome = PipelineOutcome(
+                issue.key,
+                False,
+                stage="staging-busy",
+                branch=space.branch,
+                detail=(
+                    f"Staging đang bị giữ bởi run khác (issue {existing.issue_key}) "
+                    "— thử lại sau."
+                ),
+                run_id=run_id,
+                attempt=attempt_no,
+                aborted=True,
+            )
+            return _finish(
+                client, issue, outcome, statuses, error_status,
+                worktree_root=worktree_root,
+            )
+        staging_token = staging_tokens.mint(
+            run_id,
+            issue_key=issue.key,
+            worktrees={s.repo: s.path for s in spaces},
+            ttl_minutes=timeout_minutes,
+        )
+        staging_ctx = mapping.StagingContext(
+            control_base_url=default_staging_control_url(),
+            artifacts_dir=agent_log.container_artifacts_dir(
+                sandbox_runner.WORKTREE_MOUNT, run_id
+            ),
+            storefront_url=default_storefront_url(),
+            storefront_password=default_storefront_password(),
+        )
+
     # Resolved from the catalog each run, rather than trusting stale names in
     # settings: a pack removed or renamed from the store since it was enabled
     # should quietly drop out, not break the run.
@@ -374,11 +512,11 @@ def run_issue(
     prompt = mapping.build_prompt(
         issue,
         workdirs[0],
-        implement=not advice,
+        implement=True,
         monorepo=sandbox_runner.MONOREPO_MOUNT,
-        advice=advice,
         extra_workdirs=workdirs[1:],
         enabled_skills=[(p.name, p.description) for p in enabled_packs],
+        staging=staging_ctx,
     )
     # Retry *this stage*, in place, same run_id — not a new attempt, not a new
     # comment. A transient sandbox failure ("AI gặp lỗi ở process 2") used to
@@ -391,11 +529,14 @@ def run_issue(
             space.path,
             worktree_root=worktree_root,
             timeout_minutes=timeout_minutes,
-            implement=not advice,
+            implement=True,
             run_id=run_id,
             monorepo=monorepo,
             enabled_skills=enabled_packs,
             skill_packs_root=skill_packs_root,
+            staging=staging_requested,
+            staging_token=staging_token,
+            agent_repos_root=workspace.default_agent_repos_root(),
         )
         if result.ok or stage_attempt == stage_retries:
             break
@@ -416,37 +557,43 @@ def run_issue(
             run_id=run_id,
             attempt=attempt_no,
         )
-        return _finish(client, issue, outcome, statuses, error_status)
+        return _finish(client, issue, outcome, statuses, error_status, worktree_root=worktree_root)
 
-    if advice:
-        # The deliverable is the answer, not a diff. Skipping the change check
-        # here is the whole point: a cosmetic, per-merchant request must not edit
-        # the app, so "changed nothing" is the correct outcome, not a failure.
+    # Drop lockfile/generated-output churn before judging whether the run
+    # changed anything, so a run whose only diff was a lockfile or a rebuilt
+    # cdn-dist bundle is correctly reported as no-change instead of shipping
+    # that churn into a real merge request.
+    discarded: list[str] = []
+    for candidate in spaces:
+        discarded += [f"{candidate.repo}/{name}"
+                      for name in workspace.discard_generated_changes(candidate)]
+
+    touched = [candidate for candidate in spaces if workspace.has_changes(candidate)]
+
+    if not touched and (
+        mapping.is_snippet_deliverable(result.output)
+        or mapping.is_no_change_needed(result.output)
+    ):
+        # The agent judged this ticket solvable without touching this repo —
+        # either a theme-level snippet, or (found live) the ask was already
+        # achievable with an existing feature — and declared so explicitly
+        # (see IMPLEMENT_INSTRUCTIONS). "Changed nothing" is the correct
+        # outcome here, not a failure. The deliverable is the answer itself,
+        # not a diff.
         outcome = PipelineOutcome(
             issue.key,
-            bool(result.output.strip()),
-            stage="done" if result.output.strip() else "sandbox",
+            True,
+            stage="done",
             branch=space.branch,
             sandbox_id=result.sandbox_id,
-            detail="" if result.output.strip() else "agent không trả về nội dung nào",
             run_id=run_id,
             attempt=attempt_no,
             advice=True,
         )
         return _finish(
-            client, issue, outcome, statuses,
-            done_status if outcome.ok else error_status,
-            answer=result.output,
+            client, issue, outcome, statuses, done_status,
+            answer=result.output, worktree_root=worktree_root,
         )
-
-    # Drop lockfile churn before judging whether the run changed anything, so a
-    # run whose ONLY output was a lockfile is correctly reported as no-change.
-    discarded: list[str] = []
-    for candidate in spaces:
-        discarded += [f"{candidate.repo}/{name}"
-                      for name in workspace.discard_lockfile_changes(candidate)]
-
-    touched = [candidate for candidate in spaces if workspace.has_changes(candidate)]
 
     if not touched:
         outcome = PipelineOutcome(
@@ -457,9 +604,9 @@ def run_issue(
             sandbox_id=result.sandbox_id,
             detail=(
                 (
-                    "Agent chỉ thay đổi lockfile ("
+                    "Agent chỉ thay đổi lockfile/generated-output ("
                     + ", ".join(discarded)
-                    + "), đã bỏ — lockfile không được vào MR.\n\n"
+                    + "), đã bỏ — không được vào MR.\n\n"
                     if discarded
                     else "Agent chạy xong nhưng không sửa file nào.\n\n"
                 )
@@ -469,7 +616,7 @@ def run_issue(
             run_id=run_id,
             attempt=attempt_no,
         )
-        return _finish(client, issue, outcome, statuses, error_status)
+        return _finish(client, issue, outcome, statuses, error_status, worktree_root=worktree_root)
 
     changed = "\n".join(
         f"[{candidate.repo}]\n{workspace.diffstat(candidate)}" for candidate in touched
@@ -516,7 +663,7 @@ def run_issue(
             merge_requests=tuple(merge_requests),
             discarded=tuple(discarded),
         )
-        return _finish(client, issue, outcome, statuses, error_status)
+        return _finish(client, issue, outcome, statuses, error_status, worktree_root=worktree_root)
 
     outcome = PipelineOutcome(
         issue.key,
@@ -531,18 +678,39 @@ def run_issue(
         discarded=tuple(discarded),
         merge_requests=tuple(merge_requests),
     )
-    return _finish(client, issue, outcome, statuses, done_status, answer=result.output)
+    answer = result.output
+    if mapping.is_snippet_deliverable(answer) or mapping.is_no_change_needed(answer):
+        # A real diff shipped AND the agent declared "no code needed" — a
+        # contradiction (it should be one or the other). Surface it loudly
+        # rather than let the heading sit as inert prose in a comment that
+        # otherwise reads as an ordinary "opened a merge request" report.
+        answer = (
+            "⚠️ Agent tự khai không cần sửa code (\"DELIVERABLE: SNIPPET\" hoặc "
+            "\"DELIVERABLE: NO CHANGE NEEDED\") nhưng lại sửa code thật trong "
+            "repo — có thể mâu thuẫn, reviewer cần tự kiểm tra kỹ trước khi "
+            "merge.\n\n"
+        ) + answer
+    return _finish(
+        client, issue, outcome, statuses, done_status,
+        answer=answer, worktree_root=worktree_root,
+    )
 
 
 def _finish(client, issue, outcome: PipelineOutcome, statuses, status_name: str,
-            answer: str = ""):
+            answer: str = "", worktree_root: Path | None = None):
     """Report to Twenty, move the issue, and close the run record out.
 
     Closing the record here rather than at each call site is what keeps the
     attempt counter honest: every path that ends a run goes through this
     function, so no failure can slip by uncounted and quietly reset the cap.
+    The same reasoning covers the staging token: revoking it here, for every
+    outcome, means no exit path (success, failure, or an early return before
+    the sandbox even started) can leave one live past its own run.
     """
-    _comment(client, issue.id, _report(outcome, issue.key, answer))
+    staging_tokens.revoke(outcome.run_id)
+    comment_id = _comment(client, issue.id, _report(outcome, issue.key, answer))
+    if worktree_root is not None and outcome.run_id:
+        _attach_screenshots(client, issue.id, comment_id, worktree_root, outcome.run_id)
     target = statuses.get(status_name)
     if target and _move(client, issue.id, target):
         outcome.moved_to = status_name
