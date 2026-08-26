@@ -29,3 +29,17 @@ RUN npm install -g "@playwright/mcp@${PLAYWRIGHT_MCP_VERSION}" "playwright-core@
     # matches whichever host account started the run (sandbox_runner.AGENT_UID)
     # — never the uid that ran this RUN step.
     && chmod -R a+rX "${PLAYWRIGHT_BROWSERS_PATH}"
+
+# Xvfb: a headless-looking `--headless` Chromium is exactly the pattern
+# Cloudflare's bot-management is built to catch — confirmed live, repeatedly,
+# on this same store — while a real headed browser with the same session
+# sails through with zero challenge. There is no real display in this
+# container, so Xvfb fakes one Chromium can render into, letting
+# sandbox_runner.py drop `--headless` and launch actual headed Chromium
+# whenever a captured Chrome profile is mounted (see its own
+# SHOPIFY_CHROME_PROFILE_DIRNAME comment). `--with-deps` above already
+# installed Chromium's own shared-library dependencies; this is the one
+# extra package neither that nor the base image provides.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends xvfb \
+    && rm -rf /var/lib/apt/lists/*

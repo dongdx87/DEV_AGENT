@@ -269,7 +269,16 @@ and the like), and avoid commands that rewrite one — prefer `npm ci` over
 `npm install`, or read the dependency's source instead of installing it. A
 lockfile diff buries the change a reviewer came to read: one ticket shipped a
 single meaningful line beside 179 lines of lockfile churn. Any lockfile change
-is reverted before committing, so touching one only wastes the run."""
+is reverted before committing, so touching one only wastes the run.
+
+Any user-facing text you add or change in shopify-app-loyalty-cms must be
+translated into EVERY locale the app already ships, not left English-only.
+List the real folders under web/frontend/locales/ yourself — do not assume a
+count or a fixed list, it changes over time — and add the same key to each
+one's JSON file, matching the phrasing/placeholder style of the nearest
+existing key already in that same file. This is not optional follow-up work:
+a run that ships a new string in en/common.json alone and reports the other
+locales as "left out" has not finished the ticket."""
 
 #: Product documentation, mounted with the monorepo. 77 files grouped by feature
 #: (earning, redeeming, vip-tiers, referrals, promotions, storefront,

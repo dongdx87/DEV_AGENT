@@ -527,6 +527,16 @@ def test_the_staging_allowlist_never_names_a_bare_ip():
         assert not fqdn.replace(".", "").isdigit(), fqdn
 
 
+def test_the_staging_allowlist_includes_the_cloudflare_challenge_script():
+    """admin.shopify.com's WAF occasionally serves a real interactive
+    Turnstile challenge instead of passively trusting the mounted profile —
+    confirmed live: a real run's console log showed ERR_NAME_NOT_RESOLVED for
+    this exact domain, and the page never got past "Just a moment…" as a
+    direct result, even with headed Chromium and the profile mounted.
+    """
+    assert "challenges.cloudflare.com" in sandbox_runner.STAGING_EGRESS_ALLOW
+
+
 def test_network_policy_denies_by_default_and_allows_only_the_list():
     policy = sandbox_runner._network_policy(sandbox_runner.STAGING_EGRESS_ALLOW)
 
@@ -686,6 +696,137 @@ def test_an_ordinary_non_staging_run_never_mounts_the_shopify_session(tmp_path):
     )
     assert "storageState" not in script
     assert ".mcp.json" not in script
+
+
+# ---------------------------------------------------------------------------
+# Chrome profile reuse: a fresh headless context + replayed cookies is a
+# pattern Cloudflare's bot-management is built to catch — mounting the whole
+# aged profile instead is the fix. See SHOPIFY_CHROME_PROFILE_DIRNAME's own
+# comment for the live evidence behind this.
+# ---------------------------------------------------------------------------
+
+
+def test_no_profile_dir_means_no_volume_and_falls_back_to_storage_state(tmp_path):
+    auth_dir = tmp_path / "auth"
+    auth_dir.mkdir()
+    (auth_dir / sandbox_runner.SHOPIFY_STORAGE_STATE_FILENAME).write_text(
+        "{}", encoding="utf-8"
+    )
+
+    assert sandbox_runner._shopify_chrome_profile_path(auth_dir) is None
+    assert sandbox_runner._shopify_chrome_profile_path(None) is None
+
+    volumes = sandbox_runner._volumes(tmp_path / "wt", shopify_auth_dir=auth_dir)
+    assert not any(v.name == "shopify-chrome-profile" for v in volumes)
+    # The plain storageState mount still works when no profile exists.
+    assert any(v.name == "shopify-auth" for v in volumes)
+
+
+def test_an_empty_profile_directory_is_treated_as_absent(tmp_path):
+    """A placeholder directory with no ``Default`` subdir is nobody having
+    actually captured a profile yet — must fall back exactly like a missing
+    directory would, not crash or mount an empty/broken profile."""
+    auth_dir = tmp_path / "auth"
+    (auth_dir / sandbox_runner.SHOPIFY_CHROME_PROFILE_DIRNAME).mkdir(parents=True)
+
+    assert sandbox_runner._shopify_chrome_profile_path(auth_dir) is None
+
+
+def test_a_captured_profile_is_mounted_read_write_at_its_own_path(tmp_path):
+    auth_dir = tmp_path / "auth"
+    profile = auth_dir / sandbox_runner.SHOPIFY_CHROME_PROFILE_DIRNAME
+    (profile / "Default").mkdir(parents=True)
+
+    path = sandbox_runner._shopify_chrome_profile_path(auth_dir)
+    assert path == profile
+
+    volumes = sandbox_runner._volumes(tmp_path / "wt", shopify_auth_dir=auth_dir)
+    (volume,) = [v for v in volumes if v.name == "shopify-chrome-profile"]
+    assert volume.mount_path == sandbox_runner.SHOPIFY_CHROME_PROFILE_MOUNT
+    assert volume.read_only is not True, "Chrome must be able to write its own profile"
+    assert volume.host.path == str(profile)
+
+
+def test_the_mcp_config_adds_user_data_dir_only_when_the_profile_is_mounted():
+    without = json.loads(sandbox_runner._staging_mcp_json(False))
+    with_profile = json.loads(sandbox_runner._staging_mcp_json(True))
+
+    args_without = without["mcpServers"]["playwright"]["args"]
+    args_with = with_profile["mcpServers"]["playwright"]["args"]
+    assert "--user-data-dir" not in args_without
+    assert "--user-data-dir" in args_with
+    assert sandbox_runner.SHOPIFY_CHROME_PROFILE_MOUNT in args_with
+
+
+def test_headed_mode_replaces_headless_only_when_the_profile_is_mounted():
+    """Mounting the profile alone did not get a real run past Cloudflare —
+    confirmed live. `--headless` is Chromium's clearest automation tell, so
+    it only comes off when there is an aged profile worth protecting;
+    without one, the cheaper already-proven headless path stays default.
+    """
+    without = json.loads(sandbox_runner._staging_mcp_json(False))
+    with_profile = json.loads(sandbox_runner._staging_mcp_json(True))
+
+    server_without = without["mcpServers"]["playwright"]
+    server_with = with_profile["mcpServers"]["playwright"]
+    assert "--headless" in server_without["args"]
+    assert "--headless" not in server_with["args"]
+    assert server_without["env"] == {}
+    assert server_with["env"] == {"DISPLAY": sandbox_runner.XVFB_DISPLAY}
+
+
+def test_xvfb_only_starts_when_a_profile_will_run_headed():
+    assert sandbox_runner._xvfb_prefix(False) == ""
+    prefix = sandbox_runner._xvfb_prefix(True)
+    assert prefix.startswith("Xvfb ")
+    assert sandbox_runner.XVFB_DISPLAY in prefix
+
+
+def test_a_mounted_profile_wins_over_a_stale_storage_state_file(tmp_path):
+    """Both can exist on disk at once (an old capture plus a new one) — the
+    profile must win, and storageState must not appear in the script at all:
+    Playwright does not support layering a storageState override on top of
+    launchPersistentContext.
+    """
+    auth_dir = tmp_path / "auth"
+    auth_dir.mkdir()
+    (auth_dir / sandbox_runner.SHOPIFY_STORAGE_STATE_FILENAME).write_text(
+        "{}", encoding="utf-8"
+    )
+    (auth_dir / sandbox_runner.SHOPIFY_CHROME_PROFILE_DIRNAME / "Default").mkdir(
+        parents=True
+    )
+
+    script = sandbox_runner._setup_script(
+        "do the thing", staging=True, shopify_auth_dir=auth_dir
+    )
+    assert "storageState" not in script
+    assert sandbox_runner._b64(sandbox_runner._staging_mcp_json(True)) in script
+
+
+def test_stale_singleton_files_are_cleared_before_the_next_run(tmp_path):
+    """A run killed uncleanly (host power loss, container OOM) leaves these
+    behind — the very next staging-verify run must not see the shared
+    profile as permanently "already in use". Confirmed live: the first real
+    run after this profile-mount feature shipped hit exactly this, left over
+    from an interrupted smoke test.
+    """
+    profile = tmp_path / "chrome-profile"
+    profile.mkdir()
+    for name in sandbox_runner._CHROME_SINGLETON_FILES:
+        (profile / name).symlink_to("some-stale-target")
+
+    sandbox_runner._clear_stale_chrome_singleton_files(profile)
+
+    for name in sandbox_runner._CHROME_SINGLETON_FILES:
+        assert not (profile / name).exists()
+
+
+def test_clearing_singleton_files_tolerates_none_being_present(tmp_path):
+    profile = tmp_path / "chrome-profile"
+    profile.mkdir()
+
+    sandbox_runner._clear_stale_chrome_singleton_files(profile)  # must not raise
 
 
 def test_run_in_sandbox_defaults_the_auth_dir_when_staging(monkeypatch):

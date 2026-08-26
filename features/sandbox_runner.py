@@ -104,6 +104,15 @@ STAGING_EGRESS_ALLOW: tuple[str, ...] = (
     "*.myshopify.com",
     "cdn.shopify.com",
     "monorail-edge.shopifysvc.com",
+    # admin.shopify.com's WAF occasionally serves a real interactive Cloudflare
+    # Turnstile challenge instead of passively trusting the mounted profile's
+    # cookies (see SHOPIFY_CHROME_PROFILE_DIRNAME's own comment) — confirmed
+    # live: a real run's console log showed ERR_NAME_NOT_RESOLVED for exactly
+    # this domain's /turnstile/v0/b/.../api.js, and the page never got past
+    # "Just a moment…" as a direct result, even with the profile mounted and
+    # headed Chromium. Without this domain, that specific case can never
+    # resolve — the challenge script itself is what proves the browser real.
+    "challenges.cloudflare.com",
     # These two were previously stale ("dev-bloy-api-staging"/"dev-bloy-cms-
     # staging") — a real name that never existed, not the tunnel actually
     # deployed. Confirmed live: a real staging-verify run tried to reach the
@@ -134,6 +143,48 @@ MONOREPO_MOUNT = "/monorepo"
 SHOPIFY_AUTH_DIR = Path.home() / ".bloy-shopify-auth"
 SHOPIFY_AUTH_MOUNT = "/shopify-auth"
 SHOPIFY_STORAGE_STATE_FILENAME = "storage-state.json"
+
+#: A full, aged Chrome profile (cookies AND local storage AND whatever else
+#: Cloudflare's bot-management scores a session on) — preferred over the
+#: bare storageState above whenever present. Confirmed live, repeatedly: a
+#: real interactive Playwright session reusing a long-lived profile at
+#: ``~/.cache/ms-playwright-mcp/`` walks straight into admin.shopify.com with
+#: zero challenge, while this same host's sandbox — a *fresh* headless
+#: Chromium seeded with only that session's exported cookies — hits
+#: Cloudflare's "Just a moment…" interstitial on the very same store, on the
+#: very same day. A replayed cookie in a brand-new browser fingerprint is
+#: exactly the pattern bot-management is built to catch; the fix is to hand
+#: the container the *whole* aged profile, not just its cookies, so Chromium
+#: presents the same fingerprint history a challenge already cleared for.
+#: Read-write (unlike SHOPIFY_AUTH_MOUNT): Chrome writes lock files, cache and
+#: session state into its own profile dir continuously, even when only
+#: reading pages — a read-only mount would fail to launch at all. Safe to
+#: share across runs because staging is already single-flight (at most one
+#: run holds :mod:`staging_tokens` at a time), and AGENT_UID is the host's own
+#: uid (see its own comment), so the mounted profile's ownership just works.
+SHOPIFY_CHROME_PROFILE_DIRNAME = "chrome-profile"
+SHOPIFY_CHROME_PROFILE_MOUNT = "/shopify-chrome-profile"
+
+#: Virtual display for real headed Chromium — see _staging_mcp_json's own
+#: comment for why headed mode matters here at all. ``sandbox_image/Dockerfile``
+#: installs the ``xvfb`` package that provides this binary; a container built
+#: without that package simply fails this one command (captured in the setup
+#: script's own exit-code check, same as every other setup step) rather than
+#: silently falling through to a Chromium that can't open a display.
+XVFB_DISPLAY = ":99"
+XVFB_START_COMMAND = (
+    f"Xvfb {XVFB_DISPLAY} -screen 0 1280x800x24 >/tmp/xvfb.log 2>&1 & disown"
+)
+
+
+def _xvfb_prefix(chrome_profile_mounted: bool) -> str:
+    """Shell fragment that starts Xvfb before ``claude -p``, only when a
+    mounted profile means Chromium is about to run headed (see
+    _staging_mcp_json's own comment). A tiny pure function on purpose — the
+    surrounding ``inner`` command it feeds into is built inside an async
+    function that talks to a real sandbox, out of reach for a plain unit test.
+    """
+    return f"{XVFB_START_COMMAND}; " if chrome_profile_mounted else ""
 
 #: Where the filtered copy of the monorepo is kept, sibling to the worktree
 #: root. A plain bind-mount of the real monorepo hands every sandbox every
@@ -299,6 +350,38 @@ def _shopify_storage_state_path(shopify_auth_dir: Path | None) -> Path | None:
     return candidate if candidate.is_file() else None
 
 
+def _shopify_chrome_profile_path(shopify_auth_dir: Path | None) -> Path | None:
+    """The captured Chrome profile directory, if one has actually been set up.
+
+    Checked as a non-empty directory containing real profile state (its
+    ``Default`` subdirectory), not just existence — an empty placeholder
+    directory must fall back to the plain storageState path exactly like a
+    missing one would.
+    """
+    if shopify_auth_dir is None:
+        return None
+    candidate = shopify_auth_dir / SHOPIFY_CHROME_PROFILE_DIRNAME
+    return candidate if (candidate / "Default").is_dir() else None
+
+
+#: Chrome's own instance-detection files. A previous run that was killed
+#: uncleanly (container OOM, host power loss, a `_run_async` crash before
+#: the sandbox tears itself down) leaves these behind, and every future
+#: staging-verify run would then see the profile as "already in use" and
+#: refuse to launch a browser at all — confirmed live, the very first time
+#: this profile-mount feature ran after a prior attempt was interrupted.
+#: Safe to always clear before a new run starts: staging is already
+#: single-flight (see staging_tokens's own module docstring — at most one
+#: run holds it at a time), so by the time this runs, whatever process wrote
+#: these is guaranteed to be gone, stale lock or not.
+_CHROME_SINGLETON_FILES = ("SingletonLock", "SingletonSocket", "SingletonCookie")
+
+
+def _clear_stale_chrome_singleton_files(profile: Path) -> None:
+    for name in _CHROME_SINGLETON_FILES:
+        (profile / name).unlink(missing_ok=True)
+
+
 def _volumes(
     worktree_root: Path,
     monorepo: Path | None = None,
@@ -381,6 +464,21 @@ def _volumes(
                 host=Host(path=str(shopify_auth_dir)),
                 mount_path=SHOPIFY_AUTH_MOUNT,
                 read_only=True,
+            )
+        )
+
+    # A dedicated volume, not a subpath of the read-only mount above: Chrome
+    # writes lock files, cache and session state into its own profile
+    # continuously, so this one has to be read-write. See
+    # SHOPIFY_CHROME_PROFILE_DIRNAME's own comment for why a full profile is
+    # mounted here at all instead of only the storageState file above.
+    chrome_profile = _shopify_chrome_profile_path(shopify_auth_dir)
+    if chrome_profile is not None:
+        volumes.append(
+            Volume(
+                name="shopify-chrome-profile",
+                host=Host(path=str(chrome_profile)),
+                mount_path=SHOPIFY_CHROME_PROFILE_MOUNT,
             )
         )
     return volumes
@@ -534,7 +632,7 @@ MCP_CONFIG_PATH = "/tmp/bloy-mcp.json"
 STAGING_MCP_OUTPUT_DIR = "/tmp/bloy-playwright-output"
 
 
-def _staging_mcp_json() -> str:
+def _staging_mcp_json(chrome_profile_mounted: bool = False) -> str:
     """The exact stanza this host itself uses for the Playwright MCP server.
 
     ``--headless`` because the container has no display; ``--no-sandbox``
@@ -547,25 +645,50 @@ def _staging_mcp_json() -> str:
     because its own default output location is the worktree — see
     :data:`STAGING_MCP_OUTPUT_DIR`'s docstring for what that leaked in
     practice.
+
+    ``--user-data-dir`` is added only when a full Chrome profile was actually
+    mounted (see SHOPIFY_CHROME_PROFILE_DIRNAME's comment for why this exists
+    at all) — this launches Playwright's persistent-context mode instead of a
+    fresh incognito-style context, so the container's Chromium presents the
+    same aged profile a Cloudflare challenge already cleared for, rather than
+    a brand-new fingerprint carrying only replayed cookies.
+
+    ``--headless`` is dropped in that same case, in favour of real headed
+    Chromium against the virtual display :data:`XVFB_DISPLAY` (started
+    separately, before this MCP server, by whoever runs it — see
+    :data:`XVFB_START_COMMAND`'s own comment). Confirmed live: mounting the
+    profile alone did not get a real run past Cloudflare's "Just a
+    moment…" challenge; `--headless` is Chromium's single most direct tell
+    that a browser is automated, and every session that has ever sailed
+    through this same store's Cloudflare challenge on this host ran headed.
+    Without a profile mounted, headed mode buys nothing (there is no aged
+    session to protect), so the cheaper, already-proven ``--headless`` path
+    stays the default.
     """
+    args = [
+        "@playwright/mcp@latest",
+        "--no-sandbox",
+        "--executable-path",
+        STAGING_CHROMIUM_EXECUTABLE,
+        "--output-dir",
+        STAGING_MCP_OUTPUT_DIR,
+        "--config",
+        PLAYWRIGHT_LAUNCH_CONFIG_PATH,
+    ]
+    env: dict[str, str] = {}
+    if chrome_profile_mounted:
+        args += ["--user-data-dir", SHOPIFY_CHROME_PROFILE_MOUNT]
+        env["DISPLAY"] = XVFB_DISPLAY
+    else:
+        args.append("--headless")
     return json.dumps(
         {
             "mcpServers": {
                 "playwright": {
                     "type": "stdio",
                     "command": "npx",
-                    "args": [
-                        "@playwright/mcp@latest",
-                        "--headless",
-                        "--no-sandbox",
-                        "--executable-path",
-                        STAGING_CHROMIUM_EXECUTABLE,
-                        "--output-dir",
-                        STAGING_MCP_OUTPUT_DIR,
-                        "--config",
-                        PLAYWRIGHT_LAUNCH_CONFIG_PATH,
-                    ],
-                    "env": {},
+                    "args": args,
+                    "env": env,
                 }
             }
         }
@@ -672,11 +795,19 @@ def _setup_script(
         ]
     mcp_lines: list[str] = []
     if staging:
-        storage_state_mounted = _shopify_storage_state_path(shopify_auth_dir) is not None
+        # Mutually exclusive: a persistent profile already carries its own
+        # cookies/storage, so contextOptions.storageState is only ever set in
+        # its absence — Playwright does not support layering one on top of
+        # the other via launchPersistentContext.
+        chrome_profile_mounted = _shopify_chrome_profile_path(shopify_auth_dir) is not None
+        storage_state_mounted = (
+            not chrome_profile_mounted
+            and _shopify_storage_state_path(shopify_auth_dir) is not None
+        )
         launch_config = _playwright_launch_config(storage_state_mounted)
         mcp_lines = [
-            f"printf '%s' {shlex.quote(_b64(_staging_mcp_json()))} | base64 -d "
-            f"> {shlex.quote(MCP_CONFIG_PATH)}",
+            f"printf '%s' {shlex.quote(_b64(_staging_mcp_json(chrome_profile_mounted)))} "
+            f"| base64 -d > {shlex.quote(MCP_CONFIG_PATH)}",
             f"printf '%s' {shlex.quote(_b64(launch_config))} | base64 -d "
             f"> {shlex.quote(PLAYWRIGHT_LAUNCH_CONFIG_PATH)}",
             # Both outside "$h", so the chown -R "$h" below never reaches
@@ -743,6 +874,10 @@ async def _run_async(
     # sync_monorepo_mirror's docstring for why.
     monorepo_mount = sync_monorepo_mirror(monorepo) if monorepo is not None else None
 
+    chrome_profile = _shopify_chrome_profile_path(shopify_auth_dir) if staging else None
+    if chrome_profile is not None:
+        _clear_stale_chrome_singleton_files(chrome_profile)
+
     # With a run id the agent streams its reasoning to a file on the shared
     # volume, so the admin page can follow along while the container works.
     host_log = agent_log.host_log_path(worktree_root, run_id) if run_id else None
@@ -789,8 +924,15 @@ async def _run_async(
                 f" --output-format stream-json --verbose"
                 f" > {shlex.quote(log_in_container)} 2> {shlex.quote(STDERR_PATH)}"
             )
+        # Started here, not in the setup script: it must still be running by
+        # the time `claude -p` spawns the Playwright MCP server as a child of
+        # *this* shell, and the setup script and this command run as
+        # separate `sandbox.commands.run` calls — a background process from
+        # the first would not survive into the second.
+        xvfb_prefix = _xvfb_prefix(chrome_profile is not None)
         inner = (
             f"export PATH={node_bin}:$PATH CI=true{_token_export(staging_token)}; "
+            f"{xvfb_prefix}"
             f"cd {shlex.quote(workdir)} && "
             f"cat {PROMPT_PATH} | claude -p {flags}{redirect}"
         )

@@ -1116,6 +1116,21 @@ def test_the_prompt_forbids_touching_lockfiles():
     assert "npm ci" in prompt
 
 
+def test_the_prompt_requires_translating_new_cms_text_into_every_locale():
+    """BLOY-153 shipped a new string in en/common.json only and reported the
+    other 19 locales as follow-up work — the user does not accept that as done.
+    """
+    from bloy_dev_agent.features.twenty import mapping
+
+    issue = mapping.normalize_issue({"id": "x", "issueKey": "BLOY-1", "title": "t"})
+
+    prompt = mapping.build_prompt(issue, "/worktrees/x", implement=True)
+
+    assert "web/frontend/locales/" in prompt
+    assert "EVERY locale" in prompt
+    assert "not optional follow-up work" in prompt
+
+
 # ---------------------------------------------------------------------------
 # Business reasoning must reach the reviewer
 # ---------------------------------------------------------------------------
