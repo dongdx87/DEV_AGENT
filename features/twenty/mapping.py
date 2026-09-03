@@ -4,6 +4,9 @@ Kept free of HTTP and database access so it can be unit-tested against
 recorded payloads. Field names come from the live workspace rather than a
 guess: the issue object exposes ``issueKey``, ``title``, ``description``
 (rich text), ``status`` (a relation to ``issueStatuses``) and ``projectId``.
+A separate ``issueComments`` object (filtered by ``issueId``) holds the
+thread; see :class:`NormalizedComment` for why its own ``createdAt`` cannot
+be trusted for ordering.
 """
 
 from __future__ import annotations
@@ -12,6 +15,29 @@ import json
 import re
 import textwrap
 from dataclasses import dataclass, field
+
+
+@dataclass
+class NormalizedComment:
+    """One comment on an issue, with its *real* timestamp resolved.
+
+    Twenty's own ``createdAt`` is unreliable for ordering: the Jira→Twenty
+    migration bulk-imported years of history through a bot account
+    (``createdBy.name == "bloy_token"``) on a single day, so every migrated
+    comment's ``createdAt`` is the *import* time, not when it was actually
+    written — sorting by it interleaves old and new comments almost at
+    random. The migration preserved the real author and timestamp inside the
+    comment body itself (``"<author> comment on <timestamp>"``), which
+    :func:`normalize_comments` parses back out when present; a comment
+    without that header is a native one and its own ``created_at`` is already
+    correct.
+    """
+
+    id: str
+    author: str
+    created_at: str
+    body: str
+    migrated: bool
 
 
 @dataclass
@@ -122,6 +148,53 @@ def normalize_issue(record: dict) -> NormalizedIssue:
         project_id=str(record.get("projectId") or ""),
         raw=record,
     )
+
+
+#: The header the Jira→Twenty migration writes at the start of a migrated
+#: comment's body — see :class:`NormalizedComment`'s docstring. Confirmed
+#: live against the real ``issueComments`` object: every sampled migrated
+#: comment matches this exact shape, one blank line before the real body.
+_MIGRATED_COMMENT_HEADER = re.compile(
+    r"^(?P<author>.+?) comment on (?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\n\n"
+)
+
+
+def normalize_comments(records: list[dict]) -> list[NormalizedComment]:
+    """Map raw ``issueComments`` records, oldest first, real-timestamp order.
+
+    Callers should treat the *last* item as the current instruction: a ticket
+    description is a snapshot from whenever it was filed, and real tickets
+    routinely get clarified or overridden by a later comment.
+    """
+    comments = []
+    for record in records:
+        text = blocknote_to_text(record.get("bodyV2"))
+        match = _MIGRATED_COMMENT_HEADER.match(text)
+        if match:
+            comments.append(
+                NormalizedComment(
+                    id=str(record.get("id") or ""),
+                    author=match.group("author").strip(),
+                    created_at=match.group("ts").replace(" ", "T"),
+                    body=text[match.end() :].strip(),
+                    migrated=True,
+                )
+            )
+            continue
+        created_by = record.get("createdBy") or {}
+        comments.append(
+            NormalizedComment(
+                id=str(record.get("id") or ""),
+                author=str(created_by.get("name") or ""),
+                created_at=str(record.get("createdAt") or ""),
+                body=text.strip(),
+                migrated=False,
+            )
+        )
+    # ISO-shaped strings ("YYYY-MM-DD..." with or without a time zone suffix)
+    # sort correctly as plain strings — no need to parse into datetimes.
+    comments.sort(key=lambda c: c.created_at)
+    return comments
 
 
 #: What the agent is asked to do when it may not modify the repository.
@@ -387,14 +460,35 @@ STAGING_INSTRUCTIONS = textwrap.dedent("""\
 
     That is the ONLY valid reason to skip. "I can't reproduce the exact bug
     condition (specific data, a specific merchant config) to demonstrate the
-    fix" is NOT a reason to skip — it is a reason to do a plain regression
-    check instead of a demonstration: deploy, open the actual screen/widget
-    your diff touches, and screenshot whatever state you CAN reach (even the
-    ordinary, un-broken case). That still proves the deploy didn't break
-    normal rendering, which a diff alone never proves. Say plainly in your
-    report that you could not reproduce the specific condition — do not
-    present the regression screenshot as if it demonstrated the fix — but
-    take it regardless.
+    fix" is NOT a reason to skip, and it is NOT a reason to settle for a plain
+    regression check either — before doing that, ask whether the missing
+    precondition is something YOU can set up. You have real Admin write
+    access, the same as a human QA engineer reproducing a report would use: a
+    second product, a collection to mark excluded, an earning rule's own
+    settings, a theme app block that needs enabling. Create whatever the
+    ticket's own bug description implies is needed. Found live: an agent with
+    working Admin access read that the test store "only has one product" and
+    stopped there, reporting the store's current data as a hard limit —
+    without ever trying Products → Add product, which would have taken under
+    a minute and let it reproduce the exact reported scenario instead of a
+    generic smoke test. Label anything you create clearly (e.g. a product
+    named "BLS-1118 test product", not something that could be mistaken for
+    real merchant data) so a human reviewing this test store later can tell
+    it apart from genuine content, and leave it in place afterward — cleaning
+    it up again is not your job, and this store's data is not shared with
+    anything real.
+
+    Only fall back to a plain regression check — deploy, open the actual
+    screen/widget your diff touches, and screenshot whatever state you CAN
+    reach (even the ordinary, un-broken case) — when the missing precondition
+    genuinely cannot be created from Admin (a third-party app you cannot
+    install, a Shopify-side state you cannot force, a plan-tier feature this
+    store does not have), not merely because the store did not already happen
+    to have the right data lying around. A regression screenshot still proves
+    the deploy didn't break normal rendering, which a diff alone never
+    proves, so it is worth taking even then — just say plainly in the report
+    that you could not reproduce the specific condition, and do not present
+    it as if it demonstrated the fix.
 
     How to reach the app — this order matters: navigate to
     `https://admin.shopify.com` FIRST (nothing else — no store slug, no app
@@ -454,6 +548,8 @@ _PROMPT_TEMPLATE = textwrap.dedent("""\
     Description:
     {body}
 
+    {comments}
+
     {orientation}
 
     {business}
@@ -488,6 +584,31 @@ def _skills_block(enabled_skills: list[tuple[str, str]] | None) -> str:
     return "\n".join(lines)
 
 
+def _comments_block(comments: list[NormalizedComment] | None) -> str:
+    """Render an issue's comment thread, oldest first, newest called out.
+
+    Empty input renders to "" so a ticket with no comments produces the same
+    prompt as before this parameter existed (matching ``_skills_block``).
+    """
+    if not comments:
+        return ""
+    lines = [
+        "## Bình luận trên ticket (theo thời gian, CŨ NHẤT ở trên)",
+        "",
+        "Mô tả ticket ở trên có thể đã cũ — nếu một bình luận bên dưới làm rõ "
+        "hoặc thay đổi yêu cầu, đặc biệt là bình luận CUỐI CÙNG (mới nhất), "
+        "hãy làm theo bình luận đó thay vì mô tả gốc.",
+        "",
+    ]
+    for index, comment in enumerate(comments):
+        marker = " (MỚI NHẤT)" if index == len(comments) - 1 else ""
+        author = comment.author or "(không rõ người)"
+        lines.append(f"[{comment.created_at}] {author}{marker}:")
+        lines.append(comment.body or "(trống)")
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
 def build_prompt(
     issue: NormalizedIssue,
     repo: str,
@@ -497,6 +618,7 @@ def build_prompt(
     extra_workdirs: list[str] | None = None,
     enabled_skills: list[tuple[str, str]] | None = None,
     staging: StagingContext | None = None,
+    comments: list[NormalizedComment] | None = None,
 ) -> str:
     """Compose the instruction sent to the coding agent.
 
@@ -557,6 +679,7 @@ def build_prompt(
         title=issue.title,
         status=issue.status_name,
         body=body,
+        comments=_comments_block(comments),
         orientation=orientation,
         task=task,
     )

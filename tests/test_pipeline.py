@@ -224,6 +224,11 @@ class FakeTwenty:
     def __init__(self):
         self.updates: list[tuple[str, dict]] = []
         self.comments: list[str] = []
+        #: Raw ``issueComments`` records list_records("issueComments", ...)
+        #: should answer with; empty by default so existing fixtures that
+        #: never mention Twenty comment threads keep producing the exact same
+        #: prompt as before that feature existed.
+        self.issue_comments: list[dict] = []
 
     def update_record(self, obj, record_id, payload):
         self.updates.append((record_id, payload))
@@ -232,6 +237,11 @@ class FakeTwenty:
     def create_record(self, obj, payload):
         self.comments.append(str(payload))
         return {}
+
+    def list_records(self, object_name_plural, *, filter_expression=None, **kwargs):
+        if object_name_plural == "issueComments":
+            return self.issue_comments
+        raise AssertionError(f"FakeTwenty.list_records not stubbed for {object_name_plural!r}")
 
 
 ISSUE = {"id": "issue-1", "issueKey": "BLOY-2", "name": "Sửa lỗi tính điểm"}
@@ -1401,6 +1411,81 @@ def test_a_single_repo_ticket_is_unchanged(monkeypatch, monorepo, tmp_path):
 
     assert outcome.ok is True
     assert outcome.merge_request_url == "https://gitlab/mr/9"
+
+
+# ---------------------------------------------------------------------------
+# Twenty comment thread reaching the prompt
+# ---------------------------------------------------------------------------
+
+
+def test_the_issues_comment_thread_reaches_the_prompt(monkeypatch, monorepo, tmp_path):
+    from bloy_dev_agent.features.twenty import mapping
+
+    client = FakeTwenty()
+    monkeypatch.setattr(pipeline, "COMMENTS_ENABLED", True)
+    client.issue_comments = [
+        {
+            "id": "c-1",
+            "createdAt": "2026-08-20T09:00:00.000Z",
+            "createdBy": {"name": "Hùng TQ"},
+            "bodyV2": mapping.text_to_blocknote(
+                "thực ra chỉ cần đổi màu nút thôi, không cần đổi text"
+            ),
+        }
+    ]
+    seen = {}
+
+    def fake_sandbox(prompt, worktree, **kwargs):
+        seen["prompt"] = prompt
+        return pipeline.sandbox_runner.SandboxResult(True, "đã sửa", "sb", 0)
+
+    monkeypatch.setattr(pipeline.sandbox_runner, "run_in_sandbox", fake_sandbox)
+    monkeypatch.setattr(pipeline.workspace, "has_changes", lambda space: True)
+    monkeypatch.setattr(pipeline.workspace, "diffstat", lambda space: " README.md | 1 +")
+    monkeypatch.setattr(
+        pipeline.workspace,
+        "commit_and_push",
+        lambda space, **kw: {"ok": True, "merge_request_url": "https://gitlab/mr/9"},
+    )
+
+    pipeline.run_issue(
+        client, ISSUE,
+        monorepo=monorepo, target_repo="shopify-app-loyalty-api",
+        worktree_root=tmp_path / "wt", statuses=STATUSES,
+    )
+
+    assert "thực ra chỉ cần đổi màu nút thôi" in seen["prompt"]
+    assert "Hùng TQ" in seen["prompt"]
+
+
+def test_a_broken_comment_fetch_does_not_fail_the_run(monkeypatch, monorepo, tmp_path):
+    """Worse context (no comments) beats no run at all."""
+    from bloy_dev_agent.features.twenty.client import TwentyError
+
+    client = FakeTwenty()
+
+    def broken_list_records(*a, **k):
+        raise TwentyError("boom")
+
+    client.list_records = broken_list_records
+    ok = pipeline.sandbox_runner.SandboxResult(True, "đã sửa", "sb-1", 0)
+    monkeypatch.setattr(pipeline, "COMMENTS_ENABLED", True)
+    monkeypatch.setattr(pipeline.sandbox_runner, "run_in_sandbox", lambda *a, **k: ok)
+    monkeypatch.setattr(pipeline.workspace, "has_changes", lambda space: True)
+    monkeypatch.setattr(pipeline.workspace, "diffstat", lambda space: " README.md | 1 +")
+    monkeypatch.setattr(
+        pipeline.workspace,
+        "commit_and_push",
+        lambda space, **kw: {"ok": True, "merge_request_url": "https://gitlab/mr/9"},
+    )
+
+    outcome = pipeline.run_issue(
+        client, ISSUE,
+        monorepo=monorepo, target_repo="shopify-app-loyalty-api",
+        worktree_root=tmp_path / "wt", statuses=STATUSES,
+    )
+
+    assert outcome.ok is True
 
 
 # ---------------------------------------------------------------------------

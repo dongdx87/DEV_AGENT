@@ -422,6 +422,118 @@ def test_only_a_real_key_prefix_is_taken(title, expected):
     assert mapping.split_title_key(title)[0] == expected
 
 
+# ---------------------------------------------------------------------------
+# normalize_comments: real-timestamp ordering for a migrated comment thread
+# ---------------------------------------------------------------------------
+
+
+def _migrated_comment(record_id, author, ts, body, twenty_created_at="2026-08-10T09:00:00.000Z"):
+    """A comment shaped exactly like the Jira->Twenty migration writes it —
+    real author/time baked into the body, Twenty's own createdAt is just the
+    bulk-import moment (confirmed live: every migrated comment lands within
+    the same import day, regardless of the real order things were said)."""
+    from bloy_dev_agent.features.twenty import mapping
+
+    return {
+        "id": record_id,
+        "createdAt": twenty_created_at,
+        "createdBy": {"name": "bloy_token"},
+        "bodyV2": mapping.text_to_blocknote(f"{author} comment on {ts}\n\n{body}"),
+    }
+
+
+def _native_comment(record_id, author, created_at, body):
+    from bloy_dev_agent.features.twenty import mapping
+
+    return {
+        "id": record_id,
+        "createdAt": created_at,
+        "createdBy": {"name": author},
+        "bodyV2": mapping.text_to_blocknote(body),
+    }
+
+
+def test_migrated_comments_sort_by_the_real_date_in_the_body_not_twentys_own():
+    """The regression this guards: Twenty's createdAt is import time for a
+    migrated comment, so sorting by it would show a 2025 comment as newer
+    than a 2026 one just because it happened to import second."""
+    from bloy_dev_agent.features.twenty import mapping
+
+    records = [
+        _migrated_comment("c-new", "Minh VH", "2026-06-09 09:07:37", "bản mới"),
+        _migrated_comment("c-old", "Hùng TQ", "2025-11-03 13:12:01", "bản cũ hơn nhiều"),
+    ]
+
+    comments = mapping.normalize_comments(records)
+
+    assert [c.id for c in comments] == ["c-old", "c-new"]
+    assert comments[0].author == "Hùng TQ"
+    assert comments[0].body == "bản cũ hơn nhiều"
+    assert comments[0].migrated is True
+
+
+def test_native_comments_use_twentys_own_created_at():
+    from bloy_dev_agent.features.twenty import mapping
+
+    records = [_native_comment("c-1", "SAE.C - Hùng TQ", "2026-08-26T10:40:50.584Z", "Đã fix")]
+
+    comments = mapping.normalize_comments(records)
+
+    assert comments[0].author == "SAE.C - Hùng TQ"
+    assert comments[0].created_at == "2026-08-26T10:40:50.584Z"
+    assert comments[0].migrated is False
+
+
+def test_migrated_and_native_comments_interleave_correctly():
+    """A thread with old migrated history AND a fresh native reply must put
+    the native one last if it really is the most recent."""
+    from bloy_dev_agent.features.twenty import mapping
+
+    records = [
+        _native_comment("c-native", "Hùng TQ", "2026-08-26T10:40:50.584Z", "Đã fix"),
+        _migrated_comment("c-mid", "Minh VH", "2026-06-09 09:07:37", "cũ hơn"),
+    ]
+
+    comments = mapping.normalize_comments(records)
+
+    assert [c.id for c in comments] == ["c-mid", "c-native"]
+
+
+def test_comments_block_marks_only_the_last_one_as_newest():
+    from bloy_dev_agent.features.twenty import mapping
+
+    issue = mapping.normalize_issue(
+        {"id": "x", "issueKey": "BLOY-1", "title": "Sửa lỗi", "description": "mô tả gốc"}
+    )
+    comments = mapping.normalize_comments(
+        [
+            _native_comment("c-1", "A", "2026-08-01T00:00:00.000Z", "bình luận đầu"),
+            _native_comment("c-2", "B", "2026-08-02T00:00:00.000Z", "bình luận cuối"),
+        ]
+    )
+
+    prompt = mapping.build_prompt(issue, "/worktrees/x", implement=True, comments=comments)
+
+    assert "bình luận đầu" in prompt
+    assert "bình luận cuối" in prompt
+    assert prompt.index("bình luận đầu") < prompt.index("bình luận cuối")
+    lines = prompt.splitlines()
+    newest_line = next(line for line in lines if "MỚI NHẤT" in line)
+    assert "B" in newest_line and "A" not in newest_line
+
+
+def test_build_prompt_without_comments_omits_the_section():
+    """No comments fetched (or none on the ticket) must not add a heading —
+    same convention as _skills_block: empty input, empty output."""
+    from bloy_dev_agent.features.twenty import mapping
+
+    issue = mapping.normalize_issue({"id": "x", "issueKey": "BLOY-1", "title": "Sửa lỗi"})
+
+    prompt = mapping.build_prompt(issue, "/worktrees/x", implement=True, comments=None)
+
+    assert "Bình luận trên ticket" not in prompt
+
+
 def test_the_prompt_is_not_indented_like_a_code_block():
     """dedent must run before interpolation, not after.
 

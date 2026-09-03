@@ -113,18 +113,28 @@ STAGING_EGRESS_ALLOW: tuple[str, ...] = (
     # headed Chromium. Without this domain, that specific case can never
     # resolve — the challenge script itself is what proves the browser real.
     "challenges.cloudflare.com",
-    # These two were previously stale ("dev-bloy-api-staging"/"dev-bloy-cms-
-    # staging") — a real name that never existed, not the tunnel actually
-    # deployed. Confirmed live: a real staging-verify run tried to reach the
-    # real CMS tunnel domain, got ERR_NAME_NOT_RESOLVED — dns+nft blocks even
-    # the DNS lookup for anything off this list, so a stale entry here fails
-    # exactly like a missing one. Cross-checked against the staging
-    # checkout's own web/.env (VITE_HOST / VITE_SERVER_URL) and
-    # shopify.app.toml's application_url, which are the actual source of
-    # truth for these hostnames.
-    "dev-dongdx2k3-bloy-staging-api.dev-bsscommerce.com",
-    "dev-dongdx2k3-bloy-staging-cms.dev-bsscommerce.com",
-    "dev-dongdx2k3-bloy-staging-control.dev-bsscommerce.com",
+    # The tester-id-scoped names below ("dev-dongdx2k3-bloy-staging-*") went
+    # stale a second time: the shared staging environment moved off a
+    # per-developer tunnel to a shared one on 2026-08-27, confirmed against
+    # /etc/cloudflared/config.yml's actual ingress rules and the CMS
+    # checkout's own web/.env (VITE_HOST) and shopify.app.toml
+    # (application_url) — those are the real source of truth for these
+    # hostnames, not this list. dns+nft blocks even the DNS lookup for
+    # anything off this list, so a stale entry here fails exactly like a
+    # missing one (confirmed live: a real run got ERR_NAME_NOT_RESOLVED
+    # against the old CMS name). staging-control has no tunnel route at all
+    # yet under the new scheme — kept here so the allowlist is ready the
+    # moment one exists; until then staging-control calls fail at the HTTP
+    # layer (502/530), not at DNS.
+    "dev-bloy-api-staging.dev-bsscommerce.com",
+    "dev-bloy-cms-staging.dev-bsscommerce.com",
+    "dev-bloy-staging-control.dev-bsscommerce.com",
+    # Shopify's own Theme Editor (opened from Admin to add/configure a theme
+    # app block, e.g. "Points on product page") loads this host for its own
+    # UI chrome. Confirmed live: a real staging-verify run trying to add that
+    # block got a blank page and a stuck load — this host resolving nowhere
+    # under dns+nft is why, not a real Theme Editor outage.
+    "online-store-web.shopifyapps.com",
 )
 
 WORKTREE_MOUNT = "/worktrees"

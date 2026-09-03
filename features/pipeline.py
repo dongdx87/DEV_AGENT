@@ -57,7 +57,7 @@ def default_staging_control_url() -> str:
     """
     return os.environ.get(
         "BLOY_STAGING_CONTROL_URL",
-        "https://dev-dongdx2k3-bloy-staging-control.dev-bsscommerce.com",
+        "https://dev-bloy-staging-control.dev-bsscommerce.com",
     )
 
 
@@ -141,6 +141,24 @@ class PipelineOutcome:
     #: worse than none — the reviewer needs both links side by side.
     merge_requests: tuple[tuple[str, str], ...] = ()
     attempt: int = 0
+
+
+def _fetch_comments(client: TwentyClient, issue_id: str) -> list[mapping.NormalizedComment]:
+    """Best-effort: a comment-fetch failure must not fail the whole run.
+
+    The agent still has the ticket description without them — worse context,
+    not no context — so this degrades to an empty thread rather than raising.
+    """
+    try:
+        records = client.list_records(
+            "issueComments", filter_expression=f'issueId[eq]:"{issue_id}"', limit=200
+        )
+    except TwentyError:
+        logger.warning(
+            "bloy_dev_agent: could not fetch comments for %s", issue_id, exc_info=True
+        )
+        return []
+    return mapping.normalize_comments(records)
 
 
 def statuses_by_name(client: TwentyClient, project_id: str) -> dict[str, str]:
@@ -350,6 +368,7 @@ def run_issue(
         worktree_root if worktree_root is not None else workspace.default_worktree_root()
     )
     issue = mapping.normalize_issue(record)
+    comments = _fetch_comments(client, issue.id)
 
     # --- attempt cap ------------------------------------------------------
     # Checked before the claim, so a blocked issue is not even moved out of its
@@ -416,27 +435,58 @@ def run_issue(
         return outcome
 
     # --- worktree ---------------------------------------------------------
-    # A ticket may name several sub-projects; the first one is where the agent
-    # starts and the rest are prepared beside it. They all live under the same
-    # mounted root, so the container sees every one of them without extra
-    # plumbing — only the prompt has to say they exist.
+    # Every repo is always prepared, write access and all — never just the
+    # one the ticket happened to name or the configured default. Found live,
+    # repeatedly: a ticket whose fix belonged in shopify-app-loyalty-cms kept
+    # burning attempts because the sandbox only had shopify-app-loyalty-api
+    # mounted read-write; the agent could already SEE the right file through
+    # the read-only monorepo mount, it just could not write there, so each
+    # attempt correctly diagnosed "wrong repo" and still had to stop and
+    # report it as a failure instead of just fixing it. A human then had to
+    # notice the pattern and manually add a `Repos:` line to unblock the next
+    # attempt. Preparing every KNOWN_REPOS worktree unconditionally removes
+    # that whole failure mode — an unneeded worktree costs one cheap `git
+    # worktree add`, not a full clone, and an empty merge request for a repo
+    # the agent never touched is already a correct, silent no-op (see
+    # build_prompt's own "if a sub-project turns out not to need changing,
+    # leave it untouched" instruction and the has_changes-per-repo check
+    # below `_finish` relies on either way).
     store.set_stage(run_id, "worktree")
-    repos = mapping.wanted_repos(issue, workspace.KNOWN_REPOS) or [target_repo]
-    # A structural fact (which repo this ticket will touch), never anything
-    # read out of the ticket's own text — see mapping.touches_ui_repo's own
-    # docstring for why a ticket body must never be able to grant its own
-    # sandbox network access and a deploy token. The finer judgment — does
-    # this SPECIFIC change actually affect the UI — is the agent's own call
-    # once it can see its diff; see mapping.STAGING_INSTRUCTIONS.
-    staging_requested = mapping.touches_ui_repo(repos)
+    declared = mapping.wanted_repos(issue, workspace.KNOWN_REPOS)
+    primary = declared[0] if declared else target_repo
+    repos = [primary] + [name for name in workspace.KNOWN_REPOS if name != primary]
+    # Staging (real deploy + a live Playwright session) stays opt-in and
+    # narrow on purpose — unlike write access, it is a real cost (the single
+    # shared staging slot, minutes of deploy time) and a real structural
+    # privilege (network egress, a deploy token) that a ticket's own text
+    # must never be able to grant itself; see touches_ui_repo's own
+    # docstring. Basing it on `declared` (the ticket's own `Repos:` line, or
+    # nothing) rather than the now-always-multi `repos` list keeps a plain
+    # backend ticket from silently paying for a deploy+browser session it
+    # never asked for just because every worktree is now mounted.
+    staging_requested = mapping.touches_ui_repo(declared or [target_repo])
     try:
-        spaces = [
-            workspace.prepare(
-                issue.key, monorepo=monorepo, repo=name, root=worktree_root
-            )
-            for name in repos
-        ]
-        space = spaces[0]
+        space = workspace.prepare(
+            issue.key, monorepo=monorepo, repo=repos[0], root=worktree_root
+        )
+        # The primary repo is required — nothing runs without it, so its own
+        # failure still aborts the whole attempt below. Every OTHER repo is
+        # best-effort: since they are now always requested rather than only
+        # when a ticket names them, one being unpreparable (a bad checkout, a
+        # repo missing on this particular host) must not take down a run that
+        # never needed it — it just quietly has one fewer worktree available,
+        # same as if it had never been in `repos` at all.
+        spaces = [space]
+        for name in repos[1:]:
+            try:
+                spaces.append(
+                    workspace.prepare(issue.key, monorepo=monorepo, repo=name, root=worktree_root)
+                )
+            except workspace.WorkspaceError:
+                logger.warning(
+                    "bloy_dev_agent: could not prepare %s for %s; continuing without it",
+                    name, issue.key, exc_info=True,
+                )
     except workspace.WorkspaceError as exc:
         outcome = PipelineOutcome(
             issue.key, False, stage="worktree", detail=str(exc),
@@ -517,6 +567,7 @@ def run_issue(
         extra_workdirs=workdirs[1:],
         enabled_skills=[(p.name, p.description) for p in enabled_packs],
         staging=staging_ctx,
+        comments=comments,
     )
     # Retry *this stage*, in place, same run_id — not a new attempt, not a new
     # comment. A transient sandbox failure ("AI gặp lỗi ở process 2") used to
