@@ -61,7 +61,7 @@
         </div>
 
         {% if step.fix and step.fix != "form" %}
-        <form method="post" action="/setup/fix/{{ step.fix }}">
+        <form method="post" action="{{ rel('/setup/fix/' ~ step.fix) }}">
           <button type="submit"
             class="whitespace-nowrap rounded-lg bg-indigo-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/40">
             {{ step.fix_label or "Sửa" }}
@@ -73,7 +73,7 @@
     {% endfor %}
   </section>
 
-  <form method="post" action="/setup" class="rounded-2xl border border-slate-200 bg-white shadow-sm p-5 space-y-4">
+  <form method="post" action="{{ rel('/setup') }}" class="rounded-2xl border border-slate-200 bg-white shadow-sm p-5 space-y-4">
     <div>
       <h2 class="text-base font-semibold text-slate-900">Kết nối Twenty</h2>
       <p class="text-sm text-slate-500 max-w-prose">
@@ -118,7 +118,7 @@
         class="rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/40">
         Lưu &amp; kiểm tra lại
       </button>
-      <a href="/setup" class="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50">
+      <a href="{{ rel('/setup') }}" class="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50">
         Kiểm tra lại
       </a>
     </div>

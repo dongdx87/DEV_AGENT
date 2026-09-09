@@ -22,7 +22,7 @@
   {# ---------- header ---------- #}
   <div class="bg-white rounded-2xl shadow-sm border border-slate-200 p-6">
     <nav class="text-xs text-slate-500">
-      <a href="/" class="hover:text-indigo-600">BLOY Dev Agent</a>
+      <a href="{{ rel('/') }}" class="hover:text-indigo-600">BLOY Dev Agent</a>
       <span class="px-1">/</span><span>Run</span>
     </nav>
     <div class="mt-1 flex items-start justify-between gap-4 flex-wrap">
@@ -140,8 +140,8 @@
     </div>
     <div class="grid grid-cols-2 gap-3 p-5 sm:grid-cols-3">
       {% for name in artifacts %}
-      <a href="/runs/{{ run.id }}/artifacts/{{ name }}" target="_blank">
-        <img src="/runs/{{ run.id }}/artifacts/{{ name }}" alt="{{ name }}"
+      <a href="{{ rel('/runs/' ~ run.id ~ '/artifacts/' ~ name) }}" target="_blank">
+        <img src="{{ rel('/runs/' ~ run.id ~ '/artifacts/' ~ name) }}" alt="{{ name }}"
              class="w-full rounded-lg border border-slate-200">
       </a>
       {% endfor %}
@@ -207,7 +207,7 @@
   async function tick() {
     let data;
     try {
-      const res = await fetch(`/api/runs/${runId}?after=${have}`);
+      const res = await fetch(`${window.BLOY_BASE_PATH}/api/runs/${runId}?after=${have}`);
       if (!res.ok) return true;
       data = await res.json();
     } catch (err) {

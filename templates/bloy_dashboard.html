@@ -29,7 +29,7 @@
         </p>
       </div>
       <div class="flex items-center gap-2">
-        <a href="/settings"
+        <a href="{{ rel('/settings') }}"
            class="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50 focus:outline-none focus:ring-2 focus:ring-indigo-500/30">
           Settings
         </a>
@@ -37,7 +37,7 @@
            class="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50 focus:outline-none focus:ring-2 focus:ring-indigo-500/30">
           Agent Routine ↗
         </a>
-        <form method="post" action="/run">
+        <form method="post" action="{{ rel('/run') }}">
           <button type="submit" {% if busy %}disabled{% endif %}
             class="inline-flex items-center rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/40 disabled:cursor-not-allowed disabled:bg-slate-300">
             {{ 'Đang chạy…' if busy else 'Chạy ngay' }}
@@ -90,7 +90,7 @@
       <p class="mt-1 text-2xl font-semibold text-slate-900">
         {{ counts.get('ok', 0) }}<span class="text-base font-normal text-slate-400">/{{ counts.values() | sum }}</span>
       </p>
-      <a href="/preflight" class="mt-1 inline-block text-xs text-indigo-600 hover:text-indigo-500">
+      <a href="{{ rel('/preflight') }}" class="mt-1 inline-block text-xs text-indigo-600 hover:text-indigo-500">
         Xem chi tiết →
       </a>
     </div>
@@ -125,7 +125,7 @@
           <div class="flex items-start justify-between gap-4 flex-wrap">
             <div class="min-w-0">
               <div class="flex items-center gap-2">
-                <a href="/runs/{{ run.id }}"
+                <a href="{{ rel('/runs/' ~ run.id) }}"
                    class="text-sm font-semibold text-slate-900 hover:text-indigo-600">{{ run.issue_key }}</a>
                 {{ state_pill(run.state) }}
                 <span class="text-xs text-slate-500">lần thử {{ run.attempt }}/{{ max_attempts }}</span>
@@ -155,7 +155,7 @@
             {% endfor %}
           </ol>
 
-          <a href="/runs/{{ run.id }}"
+          <a href="{{ rel('/runs/' ~ run.id) }}"
              class="mt-3 inline-block text-xs font-medium text-indigo-600 hover:text-indigo-500">
             Xem AI thinking →
           </a>
@@ -183,7 +183,7 @@
             <p class="truncate text-sm text-amber-800">{{ run.issue_title }}</p>
             <p class="mt-0.5 text-xs text-amber-700">{{ run.detail }}</p>
           </div>
-          <form method="post" action="/attempts/{{ run.issue_id }}/reset"
+          <form method="post" action="{{ rel('/attempts/' ~ run.issue_id ~ '/reset') }}"
                 onsubmit="return confirm('Cho phép agent thử lại {{ run.issue_key }}? Mỗi lượt tốn một sandbox.')">
             <button type="submit"
               class="rounded-lg border border-amber-400 bg-white px-3 py-1.5 text-xs font-medium text-amber-800 hover:bg-amber-100 focus:outline-none focus:ring-2 focus:ring-amber-500/30">
@@ -223,7 +223,7 @@
           {% for run in history %}
             <tr class="hover:bg-slate-50/70">
               <td class="px-5 py-2.5">
-                <a href="/runs/{{ run.id }}"
+                <a href="{{ rel('/runs/' ~ run.id) }}"
                    class="font-medium text-slate-900 hover:text-indigo-600">{{ run.issue_key }}</a>
                 <p class="max-w-xs truncate text-xs text-slate-500">{{ run.issue_title }}</p>
               </td>
@@ -283,7 +283,7 @@
       <div class="flex items-start justify-between gap-4 flex-wrap">
         <div class="min-w-0">
           <div class="flex items-center gap-2">
-            <a href="/runs/${run.id}" class="text-sm font-semibold text-slate-900 hover:text-indigo-600">${run.issue_key}</a>
+            <a href="${window.BLOY_BASE_PATH}/runs/${run.id}" class="text-sm font-semibold text-slate-900 hover:text-indigo-600">${run.issue_key}</a>
             <span class="px-2 py-0.5 rounded-md text-xs font-medium ring-1 ring-inset bg-sky-50 text-sky-700 ring-sky-600/20">${run.state}</span>
             <span class="text-xs text-slate-500">lần thử ${run.attempt}/${limit}</span>
           </div>
@@ -295,12 +295,12 @@
         </div>
       </div>
       <ol class="mt-3 flex flex-wrap items-center gap-1.5">${stageRail(run)}</ol>
-      <a href="/runs/${run.id}" class="mt-3 inline-block text-xs font-medium text-indigo-600 hover:text-indigo-500">Xem AI thinking &rarr;</a>
+      <a href="${window.BLOY_BASE_PATH}/runs/${run.id}" class="mt-3 inline-block text-xs font-medium text-indigo-600 hover:text-indigo-500">Xem AI thinking &rarr;</a>
     </article>`;
 
   async function tick() {
     try {
-      const res = await fetch('/api/runs/active', { headers: { 'Accept': 'application/json' } });
+      const res = await fetch(window.BLOY_BASE_PATH + '/api/runs/active', { headers: { 'Accept': 'application/json' } });
       if (!res.ok) return;
       const data = await res.json();
       const runs = data.active || [];

@@ -5,6 +5,14 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}{{ title or "BLOY Dev Agent" }}{% endblock %}</title>
 
+  {# Makes every relative link/action/fetch in these templates resolve under
+     whatever subpath a reverse proxy puts this service behind (see
+     service.py's base_path()/_rel()) instead of the domain root. Empty
+     base_path still needs the trailing "/" here — that is what makes "." and
+     "settings" resolve to "/" and "/settings" in the default (no proxy) case. #}
+  <base href="{{ base_path }}/">
+  <script>window.BLOY_BASE_PATH = {{ base_path | tojson }};</script>
+
   {# Same font and Tailwind setup as the BAM admin, so the two consoles read as
      one product even though they are now separate servers. #}
   <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -61,7 +69,7 @@
       ] %}
       {% for href, label in nav %}
         {% set active = (request.url.path == href) or (href != "/" and request.url.path.startswith(href)) %}
-        <a href="{{ href }}"
+        <a href="{{ rel(href) }}"
            class="block rounded-lg px-3 py-2 transition
                   {% if active %}bg-sidebar-active text-white{% else %}hover:bg-sidebar-hover hover:text-white{% endif %}">
           {{ label }}

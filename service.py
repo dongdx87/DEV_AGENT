@@ -45,6 +45,24 @@ logger = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parent
 TEMPLATES = Jinja2Templates(directory=str(PROJECT_ROOT / "templates"))
 
+
+def _rel(path: str) -> str:
+    """A root-absolute path ("/x"), rewritten to resolve against ``<base>``
+    instead of the domain root.
+
+    Every in-app link/action/src in these templates must go through this
+    (see base.html's ``<base href="{{ base_path }}/">``) rather than being
+    written as a literal ``href="/x"`` — a literal one always points at the
+    domain root, which is wrong the moment this service is reverse-proxied
+    under a subpath (e.g. nginx serving it at ``/dev-agent/``). A URL that is
+    already absolute to another origin (an MR link, ``bam_url()``) must NOT
+    go through this — those are unaffected by ``<base>`` either way.
+    """
+    return path[1:] or "."
+
+
+TEMPLATES.env.globals["rel"] = _rel
+
 DEFAULT_PORT = 8100
 
 #: Where the sub-projects are cloned from when the setup page fills in a
@@ -98,6 +116,17 @@ def port() -> int:
 
 def bam_url() -> str:
     return os.environ.get("BAM_URL", "http://localhost:8000").rstrip("/")
+
+
+def base_path() -> str:
+    """URL prefix this service is reverse-proxied under, if any.
+
+    Empty by default (served at its own domain root). Set ``BLOY_AGENT_URL``
+    on the BAM side to include the same prefix, and set this env var here so
+    the pages this service renders know to write their own links relative to
+    it — see ``_rel()`` and base.html's ``<base>`` tag.
+    """
+    return os.environ.get("BLOY_AGENT_BASE_PATH", "").rstrip("/")
 
 
 # ---------------------------------------------------------------------------
@@ -378,9 +407,24 @@ def trigger_health() -> dict:
     }
 
 
+def _redirect(path: str, status_code: int = 303) -> RedirectResponse:
+    """Like ``RedirectResponse`` but ``path`` gets the same subpath prefix as
+    every in-page link (see ``_rel()``) — a bare ``Location: /settings``
+    header is just as wrong behind a reverse proxy as a bare ``href`` would
+    be, since the browser resolves it against the domain root either way.
+    """
+    return RedirectResponse(url=f"{base_path()}{path}", status_code=status_code)
+
+
 def _shell(request: Request, **context) -> dict:
     """Context every page needs for the sidebar."""
-    return {"request": request, "port": port(), "bam_url": bam_url(), **context}
+    return {
+        "request": request,
+        "port": port(),
+        "bam_url": bam_url(),
+        "base_path": base_path(),
+        **context,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -424,7 +468,7 @@ def create_app() -> FastAPI:
     def run_detail(request: Request, run_id: str):
         run = store.get_run(run_id)
         if run is None:
-            return RedirectResponse(url="/", status_code=303)
+            return _redirect("/")
         events = agent_log.parse(Path(run.log_path)) if run.log_path else []
         artifacts = agent_log.list_artifacts(workspace.default_worktree_root(), run_id)
         return TEMPLATES.TemplateResponse(
@@ -499,7 +543,7 @@ def create_app() -> FastAPI:
                 store.SETTING_TIMEOUT_MINUTES: timeout_minutes.strip(),
             }
         )
-        return RedirectResponse(url="/settings", status_code=303)
+        return _redirect("/settings")
 
     # ---------------- skills ----------------
     #
@@ -555,7 +599,7 @@ def create_app() -> FastAPI:
         if skills_root.strip():
             values[store.SETTING_SKILLS_ROOT] = skills_root.strip()
         store.save_settings(values)
-        return RedirectResponse(url="/skills", status_code=303)
+        return _redirect("/skills")
 
     # ---------------- setup ----------------
 
@@ -616,13 +660,13 @@ def create_app() -> FastAPI:
         if twenty_api_key.strip():
             values[store.SETTING_TWENTY_KEY] = twenty_api_key.strip()
         store.save_settings(values)
-        return RedirectResponse(url="/setup", status_code=303)
+        return _redirect("/setup")
 
     @app.post("/setup/fix/{action}")
     def apply_fix(request: Request, action: str):
         """Run one named repair. Only the fixed set is reachable."""
         if action not in setup_wizard.FIXES:
-            return RedirectResponse(url="/setup", status_code=303)
+            return _redirect("/setup")
 
         saved = store.get_settings()
         monorepo = Path(saved.get(store.SETTING_MONOREPO) or pipeline.default_monorepo())
@@ -703,7 +747,7 @@ def create_app() -> FastAPI:
     def reset_attempts_route(issue_id: str):
         """Release an issue the cap has blocked — deliberately a human action."""
         store.reset_attempts(issue_id)
-        return RedirectResponse(url="/", status_code=303)
+        return _redirect("/")
 
     @app.post("/run")
     def run_now(background: BackgroundTasks, max_issues: str = Form(default="1")):
@@ -712,7 +756,7 @@ def create_app() -> FastAPI:
         except ValueError:
             count = 1
         RUNNER.try_start({"max_issues": count})
-        return RedirectResponse(url="/", status_code=303)
+        return _redirect("/")
 
     # ---------------- API ----------------
 

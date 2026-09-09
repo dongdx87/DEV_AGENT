@@ -7,7 +7,7 @@
 
   <div class="bg-white rounded-2xl shadow-sm border border-slate-200 p-6">
     <nav class="text-xs text-slate-500">
-      <a href="/" class="hover:text-indigo-600">BLOY Dev Agent</a>
+      <a href="{{ rel('/') }}" class="hover:text-indigo-600">BLOY Dev Agent</a>
       <span class="px-1">/</span><span>Skills</span>
     </nav>
     <h1 class="mt-1 text-2xl font-semibold tracking-tight text-slate-900">Skills</h1>
@@ -31,7 +31,7 @@
   </div>
   {% endif %}
 
-  <form method="post" action="/skills" class="space-y-5">
+  <form method="post" action="{{ rel('/skills') }}" class="space-y-5">
     <section class="rounded-2xl border border-slate-200 bg-white shadow-sm p-5 space-y-3">
       <div>
         <label for="skills_root" class="block text-sm font-medium text-slate-800">Kho skill pack</label>
@@ -66,7 +66,7 @@
         class="rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/40">
         Lưu
       </button>
-      <a href="/skills" class="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50">
+      <a href="{{ rel('/skills') }}" class="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50">
         Huỷ
       </a>
     </div>

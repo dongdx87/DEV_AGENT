@@ -16,7 +16,7 @@
 
   <div class="bg-white rounded-2xl shadow-sm border border-slate-200 p-6">
     <nav class="text-xs text-slate-500">
-      <a href="/" class="hover:text-indigo-600">BLOY Dev Agent</a>
+      <a href="{{ rel('/') }}" class="hover:text-indigo-600">BLOY Dev Agent</a>
       <span class="px-1">/</span><span>Settings</span>
     </nav>
     <h1 class="mt-1 text-2xl font-semibold tracking-tight text-slate-900">Cấu hình agent</h1>
@@ -27,7 +27,7 @@
     </p>
   </div>
 
-  <form method="post" action="/settings" class="space-y-5">
+  <form method="post" action="{{ rel('/settings') }}" class="space-y-5">
 
     {# ---------- cost guard ---------- #}
     <section class="rounded-2xl border border-amber-300 bg-amber-50/50 shadow-sm p-5">
@@ -104,7 +104,7 @@
         class="inline-flex items-center justify-center rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/40">
         Lưu cấu hình
       </button>
-      <a href="/"
+      <a href="{{ rel('/') }}"
          class="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50 focus:outline-none focus:ring-2 focus:ring-indigo-500/30">
         Huỷ
       </a>
@@ -114,7 +114,7 @@
   <p class="text-xs text-slate-400">
     Môi trường: {{ counts.get('ok', 0) }} ok · {{ counts.get('warn', 0) }} warn ·
     {{ counts.get('fail', 0) }} fail —
-    <a href="/preflight" class="text-indigo-600 hover:text-indigo-500">xem preflight</a>
+    <a href="{{ rel('/preflight') }}" class="text-indigo-600 hover:text-indigo-500">xem preflight</a>
   </p>
 </div>
 {% endblock %}
