@@ -12,12 +12,14 @@ credential the agent cannot reach is a credential it cannot leak.
 
 Mount layout::
 
-    /worktrees      <- host worktree root   (read-write, the only one)
-    /monorepo       <- monorepo root        (read-only, CLAUDE.md + sibling projects)
-    <same path as host> <- one or two dirs that make `claude` runnable (read-only,
-                        mounted at their own absolute host path — see
-                        preflight.find_claude_mount_dirs() — only if the host has one)
-    /skill-packs    <- shared skill store   (read-only, only if any pack is enabled)
+    /worktrees          <- host worktree root  (read-write, the only one)
+    /monorepo           <- monorepo root       (read-only, CLAUDE.md + sibling projects)
+    /opt/claude-bin-N   <- dir(s) making `claude` runnable (read-only, one or two, only
+                           if the host has one — see preflight.find_claude_mount_dirs();
+                           NOT the host's own path — see CLAUDE_BIN_MOUNT_PREFIX)
+    /opt/claude-shim    <- setup-script-created symlink literally named `claude`,
+                           pointing into claude-bin-N (see _claude_shim_lines)
+    /skill-packs        <- shared skill store  (read-only, only if any pack is enabled)
 
 ``~/.claude`` is deliberately **not** mounted or copied wholesale — that
 directory also holds OAuth refresh tokens for four MCP servers this pipeline
@@ -140,6 +142,17 @@ STAGING_EGRESS_ALLOW: tuple[str, ...] = (
 )
 
 WORKTREE_MOUNT = "/worktrees"
+#: Each host directory that makes ``claude`` runnable is mounted read-only at
+#: ``{CLAUDE_BIN_MOUNT_PREFIX}{index}``. Deliberately NOT the host's own
+#: absolute path: the native installer lives under ``$HOME``, which on the
+#: production host is ``/root`` — a directory every image already ships as
+#: mode 700, so mounting there leaves the unprivileged agent user unable to
+#: traverse in at all (verified against the real image, not assumed).
+CLAUDE_BIN_MOUNT_PREFIX = "/opt/claude-bin-"
+#: Writable dir the setup script creates, holding the one symlink actually
+#: named ``claude``. First on PATH so it wins over a same-named but
+#: unresolvable symlink that may sit in a mounted source directory.
+CLAUDE_SHIM_DIR = "/opt/claude-shim"
 #: Monorepo root, read-only, so the agent can read CLAUDE.md and sibling projects.
 MONOREPO_MOUNT = "/monorepo"
 
@@ -227,9 +240,18 @@ HOST_CLAUDE_CREDENTIALS = Path.home() / ".claude" / ".credentials.json"
 #: Unprivileged user created inside the container. The uid matches the host
 #: user so files written into the bind-mounted worktree come back owned by the
 #: person who has to review them, not by root.
+#:
+#: Except when the service itself runs as root, which is how it is deployed on
+#: the production host: mirroring uid 0 into the container makes the agent
+#: *root in there too*, and the CLI refuses ``--dangerously-skip-permissions``
+#: under root outright — found live, the run failed on exactly that message.
+#: 1000 is the conventional first human uid and the one base images already
+#: ship, so it is the safest stand-in. Nothing is lost by not mirroring here:
+#: the reason to mirror is that the host user must be able to manage files the
+#: container wrote, and root already can, whoever owns them.
 AGENT_USER = "bloy"
-AGENT_UID = os.getuid()
-AGENT_GID = os.getgid()
+AGENT_UID = os.getuid() or 1000
+AGENT_GID = os.getgid() or 1000
 AGENT_HOME = f"/home/{AGENT_USER}"
 
 #: The prompt is delivered as a file and piped in, never interpolated into the
@@ -408,6 +430,22 @@ def _resolve_claude_bin_dirs() -> list[Path]:
     return find_claude_mount_dirs()
 
 
+def _claude_container_exec(claude_bin_dirs: list[Path]) -> str:
+    """Where the real ``claude`` file lands inside the container, or "".
+
+    The mount list ends with the resolved executable's own directory (see
+    preflight.find_claude_mount_dirs), and _volumes() mounts entry ``i`` at
+    ``{CLAUDE_BIN_MOUNT_PREFIX}{i}`` — so the last index is where the file
+    itself is, whatever the host called it.
+    """
+    from bloy_dev_agent.preflight import find_claude_executable
+
+    executable = find_claude_executable()
+    if executable is None or not claude_bin_dirs:
+        return ""
+    return f"{CLAUDE_BIN_MOUNT_PREFIX}{len(claude_bin_dirs) - 1}/{executable.name}"
+
+
 def _volumes(
     worktree_root: Path,
     monorepo: Path | None = None,
@@ -425,17 +463,15 @@ def _volumes(
             mount_path=WORKTREE_MOUNT,
         ),
     ]
-    # Mounted at its OWN absolute host path, not an arbitrary container path —
-    # same reason as agent_repos_root below: when the resolved `claude` is a
-    # symlink into a second directory, that symlink's target must resolve at
-    # the SAME absolute path inside the container as it does on the host, or
-    # it dangles.
-    for claude_dir in claude_bin_dirs or []:
+    # At a path of our own choosing, NOT the host's own absolute path (see
+    # CLAUDE_BIN_MOUNT_PREFIX). The setup script re-creates the `claude` name
+    # itself rather than relying on the host's symlink resolving in here.
+    for index, claude_dir in enumerate(claude_bin_dirs or []):
         volumes.append(
             Volume(
-                name=f"claude-cli-{len(volumes)}",
+                name=f"claude-cli-{index}",
                 host=Host(path=str(claude_dir)),
-                mount_path=str(claude_dir),
+                mount_path=f"{CLAUDE_BIN_MOUNT_PREFIX}{index}",
                 read_only=True,
             )
         )
@@ -798,6 +834,26 @@ def _skill_copy_lines(
     return lines
 
 
+def _claude_shim_lines(claude_exec: str) -> list[str]:
+    """Give the mounted executable the name ``claude`` on a PATH directory.
+
+    The file inside the mount is named after its version, not "claude" (see
+    preflight.find_claude_executable), so simply putting the mount on PATH
+    finds nothing — the sandbox reported ``claude: command not found`` on a
+    real run for exactly that reason. Recreating the name here also means the
+    host's own symlink never has to resolve inside the container, which it
+    cannot: it points at an absolute host path under a mode-700 ``/root``.
+    """
+    if not claude_exec:
+        return []
+    return [
+        f"mkdir -p {CLAUDE_SHIM_DIR}",
+        f"ln -sf {shlex.quote(claude_exec)} {CLAUDE_SHIM_DIR}/claude",
+        # The agent user is not root and does not own this directory.
+        f"chmod 755 {CLAUDE_SHIM_DIR}",
+    ]
+
+
 def _setup_script(
     prompt: str,
     enabled_skills: list[skill_packs.SkillPack] | None = None,
@@ -805,6 +861,7 @@ def _setup_script(
     run_id: str = "",
     staging: bool = False,
     shopify_auth_dir: Path | None = None,
+    claude_exec: str = "",
 ) -> str:
     """Create the agent user, install its Claude login, and drop the prompt in.
 
@@ -878,6 +935,7 @@ def _setup_script(
             f'printf \'%s\' {shlex.quote(_b64(claude_json))} | base64 -d > "$h/.claude.json"',
             f"printf '%s' {shlex.quote(_b64(prompt))} | base64 -d > {PROMPT_PATH}",
             f"chmod 644 {PROMPT_PATH}",
+            *_claude_shim_lines(claude_exec),
             *skill_lines,
             *mcp_lines,
             # The home directory itself, NOT recursively: the agent user needs
@@ -952,10 +1010,12 @@ async def _run_async(
     sandbox_id = getattr(sandbox, "sandbox_id", "") or getattr(sandbox, "id", "")
     logger.info("bloy_dev_agent: sandbox %s working in %s", sandbox_id, workdir)
 
+    claude_exec = _claude_container_exec(claude_bin_dirs)
     try:
         setup = await sandbox.commands.run(
             _setup_script(
-                prompt, enabled_skills, skill_packs_root, run_id, staging, shopify_auth_dir
+                prompt, enabled_skills, skill_packs_root, run_id, staging, shopify_auth_dir,
+                claude_exec,
             )
         )
         setup_output = _text(setup)
@@ -982,7 +1042,15 @@ async def _run_async(
         # separate `sandbox.commands.run` calls — a background process from
         # the first would not survive into the second.
         xvfb_prefix = _xvfb_prefix(chrome_profile is not None)
-        path_value = f"{claude_bin_dirs[0]}:$PATH" if claude_bin_dirs else "$PATH"
+        # CLAUDE_SHIM_DIR first (the actual "claude" name the setup script
+        # created); mount 0 next — for an nvm-installed CLI (a shebang script,
+        # not a self-contained binary) that is also where `node` lives, which
+        # the shebang needs on PATH to run at all.
+        path_value = (
+            f"{CLAUDE_SHIM_DIR}:{CLAUDE_BIN_MOUNT_PREFIX}0:$PATH"
+            if claude_exec
+            else "$PATH"
+        )
         inner = (
             f"export PATH={path_value} CI=true{_token_export(staging_token)}; "
             f"{xvfb_prefix}"

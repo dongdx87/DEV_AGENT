@@ -89,35 +89,35 @@ def find_claude_binary() -> str:
 
 
 def find_claude_mount_dirs() -> list[Path]:
-    """Host directories to mount into the sandbox, at their OWN absolute
-    paths, so ``claude`` is both findable on PATH and actually runnable —
-    the single place both sandbox_runner._resolve_claude_bin_dirs() (what
-    actually gets mounted) and setup_wizard.required_host_paths() (what
-    ``~/.sandbox.toml``'s allowlist must include for those mounts to be
-    permitted) resolve this from.
+    """Host directories that must be bind-mounted into the sandbox for
+    ``claude`` to run — the single place both
+    ``sandbox_runner._resolve_claude_bin_dirs()`` (what actually gets
+    mounted, at container paths of ITS OWN choosing — see
+    ``sandbox_runner.CLAUDE_BIN_MOUNT_PREFIX``, not these hosts paths
+    verbatim) and ``setup_wizard.required_host_paths()`` (what
+    ``~/.sandbox.toml``'s allowlist must include, which only cares about the
+    HOST side of a mount) resolve this from.
 
     Anthropic's native installer (``curl -fsSL https://claude.ai/install.sh |
     bash``) leaves ``claude`` on PATH as a symlink — e.g.
     ``~/.local/bin/claude`` pointing at an ABSOLUTE host path in a completely
     different tree, ``~/.local/share/claude/versions/<ver>``. That directory
     holds the real executable under a version NUMBER, not a file named
-    ``claude`` — so mounting only it (an earlier version of this function
-    did, via ``.resolve()``) put nothing named ``claude`` on PATH at all, and
-    the sandbox failed with ``claude: command not found`` even though the
-    mount itself succeeded. The fix needs BOTH directories, each mounted at
-    the SAME absolute path it has on the host (the same reason
-    ``agent_repos_root`` is mounted at its own absolute path in
-    ``_volumes()`` rather than an arbitrary one): the symlink's own
-    directory so ``claude`` resolves on PATH, and — only when it points
-    outside that directory — the resolved target's directory too, so the
-    symlink is not left dangling inside the container. An nvm-installed CLI
-    is typically a single non-symlink file (or a symlink within the SAME
-    directory, e.g. to a `.js` shim one level up inside the same nvm version
-    tree), so it normally yields just the one directory.
-
-    Order matters: PATH must be prefixed with the FIRST entry only — that is
-    the directory that actually has a file/symlink literally named
-    ``claude`` in it.
+    ``claude``, so both directories are needed regardless of where either
+    ends up mounted: the symlink's own directory (which may hold OTHER
+    binaries a shebang script needs, e.g. ``node`` for an nvm install) and,
+    only when it points outside that directory, the resolved target's own
+    directory. Preserving the host's absolute path for the mount was tried
+    first and abandoned: the native installer lives under ``$HOME``, which on
+    the production host is ``/root`` — a directory every base image ships
+    mode 700, so the unprivileged agent user could not even traverse into it,
+    confirmed against the real sandbox image. ``sandbox_runner`` mounts these
+    at container paths of its own choosing instead and re-creates the
+    ``claude`` name itself (see ``_claude_shim_lines``) — this function only
+    needs to return the right HOST directories, in an order that puts the
+    directory actually holding a file/symlink named ``claude`` first (some
+    caller may still want that one specifically, e.g. for sibling binaries
+    like ``node``).
     """
     binary = find_claude_binary()
     if not binary:
@@ -128,6 +128,26 @@ def find_claude_mount_dirs() -> list[Path]:
     if resolved_parent != path.parent:
         dirs.append(resolved_parent)
     return dirs
+
+
+def find_claude_executable() -> Path | None:
+    """The real file behind ``claude``, symlinks followed all the way.
+
+    ``find_claude_binary()`` may hand back a symlink whose target is an
+    ABSOLUTE host path (Anthropic's native installer does exactly that), which
+    cannot be followed from inside a container unless that same absolute path
+    is mounted there too. Mounting host paths verbatim turned out to be a dead
+    end — the native installer lives under ``$HOME``, and on the production
+    host that is ``/root``, which every container image ships as mode 700, so
+    the unprivileged agent user cannot even traverse into it. So the sandbox
+    mounts the RESOLVED file's directory at a path of its own choosing and
+    re-creates the ``claude`` name there itself; this is the function that
+    tells it which file to point at. Its ``.name`` is typically a version
+    number, not "claude" — that is the whole reason the symlink has to be
+    re-created rather than the directory simply put on PATH.
+    """
+    binary = find_claude_binary()
+    return Path(binary).resolve() if binary else None
 
 
 def _check_claude() -> Check:

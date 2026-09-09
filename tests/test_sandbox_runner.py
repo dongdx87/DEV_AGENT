@@ -124,6 +124,20 @@ def test_the_prompt_names_the_container_path_not_the_host_path():
     assert "/home/bss-group" not in inside
 
 
+def test_the_agent_never_runs_as_root_inside_the_container():
+    """The CLI refuses ``--dangerously-skip-permissions`` under root outright.
+
+    The uid normally mirrors the host user's so worktree files come back owned
+    by whoever reviews them — but the production host runs this service AS
+    root, and mirroring uid 0 made the container's agent root too. Found live:
+    every run there died on that refusal, after the sandbox had already been
+    built and the prompt delivered.
+    """
+    assert sandbox_runner.AGENT_UID != 0
+    assert sandbox_runner.AGENT_GID != 0
+    assert "getent passwd 0 " not in f"{sandbox_runner.RESOLVE_AGENT_USER} "
+
+
 def test_setup_adopts_an_existing_uid_instead_of_creating_a_second_user():
     """Base images ship a uid-1000 account; useradd would fail on a duplicate."""
     script = sandbox_runner._setup_script("do the thing")
@@ -256,7 +270,12 @@ def test_no_claude_binary_found_resolves_to_an_empty_list(monkeypatch):
     assert sandbox_runner._resolve_claude_bin_dirs() == []
 
 
-def test_claude_bin_dirs_are_each_mounted_read_only_at_their_own_host_path(tmp_path):
+def test_claude_bin_dirs_are_mounted_read_only_at_a_container_chosen_path(tmp_path):
+    """NOT the host's own absolute path: on the production host $HOME is
+    /root, which every image ships mode 700 — mounting there left the
+    unprivileged agent user unable to traverse in at all, confirmed against
+    the real sandbox image.
+    """
     dir_a = tmp_path / "bin"
     dir_a.mkdir()
     dir_b = tmp_path / "share" / "versions"
@@ -264,10 +283,12 @@ def test_claude_bin_dirs_are_each_mounted_read_only_at_their_own_host_path(tmp_p
 
     volumes = sandbox_runner._volumes(tmp_path / "wt", claude_bin_dirs=[dir_a, dir_b])
 
-    for claude_dir in (dir_a, dir_b):
-        mount = next(v for v in volumes if v.mount_path == str(claude_dir))
+    for index, claude_dir in enumerate((dir_a, dir_b)):
+        mount_path = f"{sandbox_runner.CLAUDE_BIN_MOUNT_PREFIX}{index}"
+        mount = next(v for v in volumes if v.mount_path == mount_path)
         assert mount.read_only is True
         assert mount.host.path == str(claude_dir)
+        assert mount.mount_path != str(claude_dir)
 
 
 def test_no_claude_bin_dirs_mounts_nothing_extra(tmp_path):
@@ -276,6 +297,44 @@ def test_no_claude_bin_dirs_mounts_nothing_extra(tmp_path):
     writable = [v.mount_path for v in volumes if not v.read_only]
     assert writable == [sandbox_runner.WORKTREE_MOUNT]
     assert len(volumes) == 1
+
+
+def test_claude_container_exec_points_at_the_last_mount_by_its_real_name(monkeypatch, tmp_path):
+    """The file inside the mount is named after its version, not "claude" —
+    this is what the setup script's symlink must point at.
+    """
+    real_dir = tmp_path / "share" / "versions"
+    real_dir.mkdir(parents=True)
+    real_binary = real_dir / "1.2.3"
+    real_binary.touch()
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    symlink = bin_dir / "claude"
+    symlink.symlink_to(real_binary)
+    monkeypatch.setattr("bloy_dev_agent.preflight.find_claude_binary", lambda: str(symlink))
+
+    assert sandbox_runner._claude_container_exec([bin_dir, real_dir]) == (
+        f"{sandbox_runner.CLAUDE_BIN_MOUNT_PREFIX}1/1.2.3"
+    )
+
+
+def test_claude_container_exec_with_no_dirs_is_empty(monkeypatch):
+    monkeypatch.setattr("bloy_dev_agent.preflight.find_claude_binary", lambda: "")
+
+    assert sandbox_runner._claude_container_exec([]) == ""
+
+
+def test_claude_shim_lines_recreate_the_name_claude_points_at_it(tmp_path):
+    exec_path = f"{sandbox_runner.CLAUDE_BIN_MOUNT_PREFIX}1/1.2.3"
+
+    lines = sandbox_runner._claude_shim_lines(exec_path)
+    script = "\n".join(lines)
+
+    assert f"ln -sf {exec_path} {sandbox_runner.CLAUDE_SHIM_DIR}/claude" in script
+
+
+def test_no_claude_exec_means_no_shim_lines():
+    assert sandbox_runner._claude_shim_lines("") == []
 
 
 # ---------------------------------------------------------------------------
