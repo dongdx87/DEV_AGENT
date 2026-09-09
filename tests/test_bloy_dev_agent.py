@@ -182,6 +182,63 @@ def test_run_detail_shows_a_staging_verify_screenshot_gallery(client, tmp_path, 
     assert f"/runs/{run_id}/artifacts/before.png" in text
 
 
+def test_run_detail_shows_the_loop_verdicts_and_the_trusted_receipts(client):
+    """The reviewer's verify step: what the evaluator said, and what actually ran."""
+    app, store = client
+    run_id = store.start_run(
+        issue_id="i-20", issue_key="BLOY-20", project_id="p-1", attempt=1
+    )
+    store.record_attempt(
+        run_id,
+        attempt=1,
+        verdict="fail",
+        score=0.4,
+        missing="thiếu guard cho status=archived",
+        tokens=12345,
+        cost_usd=0.42,
+    )
+    store.record_attempt(run_id, attempt=2, verdict="pass", score=0.95, tokens=2000)
+
+    class _Batch:
+        batch_id = "b1"
+        receipts = [
+            type(
+                "R",
+                (),
+                {
+                    "id": "r1", "repo": "shopify-app-loyalty-api",
+                    "command": "npm test", "exit_code": 1, "ok": False,
+                    "ran": True, "error": "", "duration_ms": 1200,
+                    "output_sha256": "abc", "output": "1 test failed",
+                },
+            )()
+        ]
+
+    store.record_receipts(run_id, attempt=1, batch=_Batch())
+
+    text = app.get(f"/runs/{run_id}").text
+
+    assert "Vòng lặp tự kiểm" in text
+    assert "thiếu guard cho status=archived" in text
+    assert "12,345 token" in text
+    assert "npm test" in text
+    assert "1 test failed" in text
+    assert "service tự chạy" in text
+
+
+def test_run_detail_stays_short_when_no_loop_ran(client):
+    """The legacy single-shot path must not grow the page."""
+    app, store = client
+    run_id = store.start_run(
+        issue_id="i-21", issue_key="BLOY-21", project_id="p-1", attempt=1
+    )
+
+    text = app.get(f"/runs/{run_id}").text
+
+    assert "Vòng lặp tự kiểm" not in text
+    assert "Lệnh verify" not in text
+
+
 def test_run_detail_shows_nothing_extra_when_there_is_no_artifact(client, tmp_path, monkeypatch):
     """The common case — no staging-verify ran — must not grow the page."""
     app, store = client
@@ -408,6 +465,41 @@ def test_a_second_trigger_is_refused_not_queued(client, monkeypatch):
     assert "đang chạy" in second["detail"]
 
 
+def test_a_feedback_trigger_runs_the_feedback_pass_not_a_new_one(client, monkeypatch):
+    """The two passes cost the same container; asking for one must not run the other."""
+    from bloy_dev_agent import service
+
+    called: list[str] = []
+    monkeypatch.setattr(
+        service, "run_pass_from_config", lambda config: called.append("new") or {}
+    )
+    monkeypatch.setattr(
+        service,
+        "run_feedback_from_config",
+        lambda config: called.append("feedback") or {},
+    )
+    app, _ = client
+
+    assert app.post("/api/pipeline/feedback", json={}).json()["accepted"] is True
+    service.RUNNER._thread.join(5)
+
+    assert called == ["feedback"]
+
+
+def test_an_unknown_pass_mode_is_refused_rather_than_treated_as_new(client, monkeypatch):
+    from bloy_dev_agent import service
+
+    monkeypatch.setattr(
+        service, "run_pass_from_config", lambda config: {"ran": "new"}
+    )
+    app, _ = client
+
+    app.post("/api/pipeline/run", json={"mode": "nonsense"})
+    service.RUNNER._thread.join(5)
+
+    assert "mode không hợp lệ" in (service.RUNNER.last_summary or {}).get("error", "")
+
+
 def test_a_crashing_pass_does_not_kill_the_service(client, monkeypatch):
     from bloy_dev_agent import service
 
@@ -437,7 +529,13 @@ def test_a_pass_without_a_project_id_reports_instead_of_crashing(client):
 # ---------------------------------------------------------------------------
 
 
-def test_the_plugin_contributes_only_a_link_and_a_trigger():
+def test_the_plugin_contributes_only_a_link_and_its_triggers():
+    """Two triggers, and nothing else: new work, and reviewer feedback.
+
+    They are separate routines because they want different cadences — new
+    issues arrive all day, while a feedback round only has work to do after a
+    human has read a merge request.
+    """
     from bloy_dev_agent.plugin import BloyDevAgentPlugin
 
     plugin = BloyDevAgentPlugin()
@@ -446,8 +544,10 @@ def test_the_plugin_contributes_only_a_link_and_a_trigger():
     assert plugin.routers() == [], "the UI is served by the service"
     (item,) = plugin.menu_items()
     assert item.url.startswith("http"), "the menu points at another server"
-    (action,) = plugin.routine_actions()
-    assert action.key == "bloy_run_twenty_issues"
+    assert [action.key for action in plugin.routine_actions()] == [
+        "bloy_run_twenty_issues",
+        "bloy_run_feedback_rounds",
+    ]
 
 
 def test_every_plugin_hook_is_callable_without_raising():

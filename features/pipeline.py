@@ -29,6 +29,8 @@ from pathlib import Path
 
 from bloy_dev_agent import store
 from bloy_dev_agent.features import agent_log, sandbox_runner, skill_packs, workspace
+from bloy_dev_agent.features import feedback as feedback_mod
+from bloy_dev_agent.features.coding import loop as coding_loop
 from bloy_dev_agent.features.twenty import mapping
 from bloy_dev_agent.features.twenty.client import TwentyClient, TwentyError
 from bloy_dev_agent.models import BloyPipelineRun
@@ -247,7 +249,15 @@ def _comment(client: TwentyClient, issue_id: str, text: str) -> str:
     try:
         record = client.create_record(
             "issueComments",
-            {"issueId": issue_id, "bodyV2": mapping.text_to_blocknote(text)},
+            {
+                "issueId": issue_id,
+                # Marked so a later feedback pass can tell this service's own
+                # reports from a reviewer's reply. Without the marker the report
+                # posted at the end of a revision round would itself read as new
+                # feedback, and the ticket would work itself forever — see
+                # features/feedback.py.
+                "bodyV2": mapping.text_to_blocknote(feedback_mod.stamp(text)),
+            },
         )
         return str(record.get("id") or "")
     except TwentyError as exc:
@@ -338,11 +348,32 @@ def _report(outcome: PipelineOutcome, issue_key: str, answer: str = "") -> str:
             f"Dev Agent ĐÃ DỪNG {issue_key} — hết số lần thử.\n\n{outcome.detail}"
         )
 
-    return (
+    lines = [
         f"Dev Agent không hoàn thành được {issue_key} "
-        f"(lần thử {outcome.attempt}, dừng ở bước: {outcome.stage}).\n\n"
-        f"{outcome.detail}"
-    )
+        f"(lần thử {outcome.attempt}, dừng ở bước: {outcome.stage}).",
+        "",
+        outcome.detail,
+    ]
+    # A loop that ran out of attempts still wrote code and still opened a merge
+    # request; reporting only the stage name would leave the reviewer who has to
+    # judge it with no link to what was actually produced.
+    if outcome.merge_requests or outcome.merge_request_url:
+        lines += ["", f"Branch: {outcome.branch}"]
+        if outcome.merge_requests:
+            lines.append("Merge request (CHƯA được evaluator xác nhận):")
+            lines += [f"  {repo}: {url}" for repo, url in outcome.merge_requests]
+        else:
+            lines.append(
+                f"Merge request (CHƯA được evaluator xác nhận): "
+                f"{outcome.merge_request_url}"
+            )
+        if outcome.changed:
+            lines += ["", "Thay đổi:", outcome.changed]
+        if answer:
+            lines += ["", "--- Báo cáo của agent ---", answer.strip()]
+        lines += ["", "Cần người xem và quyết định: sửa tay, hoặc comment yêu "
+                  "cầu thay đổi để Dev Agent làm lại."]
+    return "\n".join(lines)
 
 
 def run_issue(
@@ -361,8 +392,17 @@ def run_issue(
     blocked_status: str = DEFAULT_BLOCKED_STATUS,
     skill_packs_root: Path = skill_packs.DEFAULT_SKILLS_ROOT,
     enabled_skill_names: tuple[str, ...] = (),
+    feedback: mapping.NormalizedComment | None = None,
 ) -> PipelineOutcome:
-    """Take one issue all the way to a merge request."""
+    """Take one issue all the way to a merge request.
+
+    ``feedback`` turns this into a **revision round**: a reviewer commented on
+    a ticket this pipeline already reported, and their comment becomes the
+    authoritative instruction. The worktree and branch are reused (``prepare``
+    already does that), so the round continues the existing merge request
+    instead of opening a second one for the same ticket — see
+    :func:`run_feedback_pass` and :mod:`bloy_dev_agent.features.feedback`.
+    """
     monorepo = monorepo if monorepo is not None else default_monorepo()
     worktree_root = (
         worktree_root if worktree_root is not None else workspace.default_worktree_root()
@@ -569,33 +609,67 @@ def run_issue(
         staging=staging_ctx,
         comments=comments,
     )
-    # Retry *this stage*, in place, same run_id — not a new attempt, not a new
-    # comment. A transient sandbox failure ("AI gặp lỗi ở process 2") used to
-    # mean the whole issue got requeued and rerun from scratch; now only this
-    # stage retries, and only the final result of the loop is reported.
-    stage_retries = store.sandbox_stage_retries()
-    for stage_attempt in range(1, stage_retries + 1):
-        result = sandbox_runner.run_in_sandbox(
-            prompt,
-            space.path,
+    # A revision round puts the reviewer's own words in front of everything
+    # else — see features/feedback.py for why their comment outranks the
+    # description it contradicts.
+    if feedback is not None:
+        prompt = feedback_mod.revision_prompt(prompt, feedback)
+
+    loop_result: coding_loop.LoopOutcome | None = None
+    if store.loop_enabled():
+        loop_result = _run_coding_loop(
+            prompt=prompt,
+            issue=issue,
+            space=space,
+            spaces=spaces,
             worktree_root=worktree_root,
-            timeout_minutes=timeout_minutes,
-            implement=True,
             run_id=run_id,
+            timeout_minutes=timeout_minutes,
             monorepo=monorepo,
-            enabled_skills=enabled_packs,
+            enabled_packs=enabled_packs,
             skill_packs_root=skill_packs_root,
-            staging=staging_requested,
+            staging_requested=staging_requested,
             staging_token=staging_token,
-            agent_repos_root=workspace.default_agent_repos_root(),
         )
-        if result.ok or stage_attempt == stage_retries:
-            break
-        logger.info(
-            "bloy_dev_agent: sandbox thất bại ở %s (lần %d/%d trong cùng run "
-            "%s), thử lại ngay tại chỗ",
-            issue.key, stage_attempt, stage_retries, run_id,
+        result = sandbox_runner.SandboxResult(
+            # "ok" here means the container produced work, not that the
+            # evaluator accepted it: a capped or stalled loop still leaves a
+            # real diff a reviewer should see, and treating that as a failed
+            # sandbox would throw the work away and report nothing but a stage
+            # name. Whether the evaluator accepted it decides the *column* the
+            # ticket lands in, further down.
+            ok=bool(loop_result.answer) and not loop_result.setup_error,
+            output=loop_result.answer or loop_result.detail,
+            sandbox_id=loop_result.sandbox_id,
         )
+    else:
+        # Legacy single-shot path, kept behind the switch: retry *this stage*,
+        # in place, same run_id — not a new attempt, not a new comment. Note it
+        # reruns the identical prompt, which is exactly the limitation the loop
+        # above exists to fix (the evaluator tells the retry what was wrong).
+        stage_retries = store.sandbox_stage_retries()
+        for stage_attempt in range(1, stage_retries + 1):
+            result = sandbox_runner.run_in_sandbox(
+                prompt,
+                space.path,
+                worktree_root=worktree_root,
+                timeout_minutes=timeout_minutes,
+                implement=True,
+                run_id=run_id,
+                monorepo=monorepo,
+                enabled_skills=enabled_packs,
+                skill_packs_root=skill_packs_root,
+                staging=staging_requested,
+                staging_token=staging_token,
+                agent_repos_root=workspace.default_agent_repos_root(),
+            )
+            if result.ok or stage_attempt == stage_retries:
+                break
+            logger.info(
+                "bloy_dev_agent: sandbox thất bại ở %s (lần %d/%d trong cùng run "
+                "%s), thử lại ngay tại chỗ",
+                issue.key, stage_attempt, stage_retries, run_id,
+            )
     store.set_stage(run_id, "verify", sandbox_id=result.sandbox_id, output=result.output)
     if not result.ok:
         outcome = PipelineOutcome(
@@ -677,23 +751,42 @@ def run_issue(
     store.set_stage(run_id, "commit", changed=changed)
     merge_requests: list[tuple[str, str]] = []
     failures: list[str] = []
+    # A revision round pushes to a branch that already has an open merge
+    # request, so it must not ask GitLab to open another one for the same work.
+    # The existing links are read back from the run that opened them, because
+    # the report this round posts still has to give the reviewer something to
+    # click (see store.last_merge_requests).
+    existing = dict(store.last_merge_requests(issue.id)) if feedback is not None else {}
+    open_mr = create_mr and feedback is None
     for candidate in touched:
         try:
             push = workspace.commit_and_push(
                 candidate,
                 title=f"{issue.key}: {issue.title}"[:120],
                 body=(
-                    f"Dev Agent tự động thực hiện {issue.key}.\n\n"
-                    f"Sandbox: {result.sandbox_id}"
+                    (
+                        f"Dev Agent sửa lại {issue.key} theo feedback của "
+                        f"{feedback.author or 'reviewer'}.\n\n"
+                        if feedback is not None
+                        else f"Dev Agent tự động thực hiện {issue.key}.\n\n"
+                    )
+                    + f"Sandbox: {result.sandbox_id}"
                 ),
-                create_mr=create_mr,
+                create_mr=open_mr,
             )
         except workspace.WorkspaceError as exc:
             failures.append(f"{candidate.repo}: {exc}")
             continue
         if push.get("ok"):
             merge_requests.append(
-                (candidate.repo, str(push.get("merge_request_url") or ""))
+                (
+                    candidate.repo,
+                    # A revision push prints no URL (it opened nothing), so the
+                    # one this branch already has is carried forward rather than
+                    # reported as an empty link.
+                    str(push.get("merge_request_url") or "")
+                    or existing.get(candidate.repo, ""),
+                )
             )
         else:
             failures.append(f"{candidate.repo}: {push.get('detail') or 'push thất bại'}")
@@ -716,14 +809,21 @@ def run_issue(
         )
         return _finish(client, issue, outcome, statuses, error_status, worktree_root=worktree_root)
 
+    # The evaluator's verdict decides the column, not whether code was written.
+    # An attempt that produced a real diff the evaluator would not accept still
+    # opens its merge request — throwing the work away would leave a reviewer
+    # with a stage name and nothing to look at — but it must not land in the
+    # same column as verified work, or that column stops meaning anything.
+    accepted = loop_result is None or loop_result.ok
     outcome = PipelineOutcome(
         issue.key,
-        True,
-        stage="done",
+        accepted,
+        stage="done" if accepted else f"loop-{loop_result.outcome}",
         branch=space.branch,
         merge_request_url=merge_requests[0][1] if merge_requests else "",
         sandbox_id=result.sandbox_id,
         changed=changed,
+        detail="" if accepted else "\n".join(loop_result.report_lines()),
         run_id=run_id,
         attempt=attempt_no,
         discarded=tuple(discarded),
@@ -741,10 +841,106 @@ def run_issue(
             "repo — có thể mâu thuẫn, reviewer cần tự kiểm tra kỹ trước khi "
             "merge.\n\n"
         ) + answer
+    if loop_result is not None:
+        # Prepend what the loop actually did — how many attempts, what each
+        # scored, which verify commands this service ran and whether they
+        # passed. A reviewer deciding how carefully to read a merge request
+        # needs that before the agent's own account of its work.
+        answer = "\n".join(loop_result.report_lines()) + "\n\n" + answer
     return _finish(
-        client, issue, outcome, statuses, done_status,
+        client, issue, outcome, statuses,
+        done_status if accepted else (blocked_status or error_status),
         answer=answer, worktree_root=worktree_root,
     )
+
+
+def _run_coding_loop(
+    *,
+    prompt: str,
+    issue,
+    space,
+    spaces,
+    worktree_root: Path,
+    run_id: str,
+    timeout_minutes: int,
+    monorepo: Path,
+    enabled_packs,
+    skill_packs_root: Path,
+    staging_requested: bool,
+    staging_token: str,
+) -> coding_loop.LoopOutcome:
+    """Drive the coding loop for one run and persist what each attempt did.
+
+    Synchronous on purpose: every caller in this module is, and
+    ``sandbox_runner._run_coroutine`` already owns the "drive a coroutine from a
+    thread that may or may not have a loop" problem — BAM's routine scheduler
+    calls actions directly on its own event loop, which is how the very first
+    live run failed with "cannot be called from a running event loop".
+    """
+    budget = store.loop_budget()
+
+    def changed_repos() -> list[str]:
+        """Which sub-projects this attempt actually touched.
+
+        Read from the host side of the bind mount, so it sees the container's
+        uncommitted work immediately. Narrows the verify commands to the repos
+        that changed — an API-only ticket must not pay for the CMS test suite.
+        """
+        return [
+            candidate.repo
+            for candidate in spaces
+            if workspace.has_changes(candidate)
+        ]
+
+    def on_stage(name: str, fields: dict) -> None:
+        store.set_stage(run_id, name, **{
+            key: value for key, value in fields.items()
+            if key in {"sandbox_id"} and value
+        })
+
+    outcome = sandbox_runner._run_coroutine(
+        lambda: coding_loop.run_loop(
+            base_prompt=prompt,
+            # The evaluator grades against the ticket, not against the whole
+            # prompt: the prompt also carries repo layout, skills and staging
+            # instructions, and an evaluator told to check all of that starts
+            # failing tickets for not exercising a skill nobody asked for.
+            objective=f"{issue.key}: {issue.title}\n\n{issue.body or ''}".strip(),
+            worktree=space.path,
+            worktree_root=worktree_root,
+            run_id=run_id,
+            budget=budget,
+            per_attempt_minutes=timeout_minutes,
+            monorepo=monorepo,
+            enabled_skills=enabled_packs,
+            skill_packs_root=skill_packs_root,
+            staging=staging_requested,
+            staging_token=staging_token,
+            agent_repos_root=workspace.default_agent_repos_root(),
+            verify_commands_raw=store.verify_commands_raw(),
+            changed_repos=changed_repos,
+            on_stage=on_stage,
+        )
+    )
+
+    for record in outcome.attempts:
+        store.record_attempt(
+            run_id,
+            attempt=record.attempt,
+            verdict=record.verdict.verdict.value if record.verdict else "",
+            score=record.score,
+            missing=record.verdict.missing if record.verdict else "",
+            generator_ok=record.generator_ok,
+            tokens=record.tokens,
+            cost_usd=record.cost_usd,
+        )
+        store.record_receipts(run_id, attempt=record.attempt, batch=record.receipts)
+
+    logger.info(
+        "bloy_dev_agent: vòng lặp %s kết thúc %r sau %d lần thử (%s)",
+        issue.key, outcome.outcome, len(outcome.attempts), outcome.spend,
+    )
+    return outcome
 
 
 def _finish(client, issue, outcome: PipelineOutcome, statuses, status_name: str,
@@ -854,5 +1050,126 @@ def run_pass(
         "succeeded": sum(1 for o in outcomes if o.ok),
         "blocked": sum(1 for o in outcomes if o.blocked),
         "max_attempts": store.max_attempts(),
+        "issues": [asdict(o) for o in outcomes],
+    }
+
+
+def run_feedback_pass(
+    client: TwentyClient,
+    *,
+    project_id: str,
+    monorepo: Path | None = None,
+    target_repo: str = DEFAULT_TARGET_REPO,
+    review_statuses: tuple[str, ...] = (DEFAULT_DONE_STATUS, DEFAULT_BLOCKED_STATUS),
+    working_status: str = DEFAULT_WORKING_STATUS,
+    done_status: str = DEFAULT_DONE_STATUS,
+    error_status: str = DEFAULT_ERROR_STATUS,
+    blocked_status: str = DEFAULT_BLOCKED_STATUS,
+    max_issues: int = 1,
+    timeout_minutes: int = sandbox_runner.DEFAULT_TIMEOUT_MINUTES,
+    skill_packs_root: Path = skill_packs.DEFAULT_SKILLS_ROOT,
+    enabled_skill_names: tuple[str, ...] = (),
+) -> dict:
+    """Find reviewer feedback on already-reported tickets and act on it.
+
+    This is the only place a human steers the pipeline, and it uses the thing
+    reviewers already do: they comment on the ticket. A comment written *after*
+    this service's own last report, by someone who is not this service, becomes
+    the instruction for a revision round on the same branch and the same merge
+    request.
+
+    Both the review column and the blocked column are scanned. A reviewer
+    correcting work the evaluator rejected is exactly as much a revision request
+    as one correcting work it accepted — arguably more — and a ticket parked in
+    the blocked column with a human explaining what went wrong is the single
+    most useful input this pipeline can get.
+
+    Every candidate is *claimed* in the database before any work starts, keyed
+    by the comment id, so the poll running again five minutes later cannot start
+    a second container for the same comment (see ``store.claim_feedback``).
+    """
+    if not store.feedback_enabled():
+        return {"enabled": False, "picked": 0, "issues": []}
+
+    monorepo = monorepo if monorepo is not None else default_monorepo()
+    statuses = statuses_by_name(client, project_id)
+    wanted = [statuses[name] for name in review_statuses if name in statuses]
+    if not wanted:
+        return {
+            "error": f"Project has no status named any of {list(review_statuses)!r}",
+            "available": sorted(statuses),
+        }
+
+    outcomes: list[PipelineOutcome] = []
+    skipped = 0
+    for status_id in wanted:
+        if len(outcomes) >= max(1, max_issues):
+            break
+        try:
+            candidates = client.list_records(
+                "issues",
+                filter_expression=f'statusId[eq]:"{status_id}"',
+                order_by="updatedAt",
+                limit=40,
+                depth=1,
+            )
+        except TwentyError:
+            logger.warning(
+                "bloy_dev_agent: could not list issues in status %s", status_id,
+                exc_info=True,
+            )
+            continue
+
+        for record in candidates:
+            if len(outcomes) >= max(1, max_issues):
+                break
+            issue = mapping.normalize_issue(record)
+            comment = feedback_mod.pending(_fetch_comments(client, issue.id))
+            if comment is None:
+                continue
+            if not store.claim_feedback(
+                comment_id=comment.id,
+                issue_id=issue.id,
+                issue_key=issue.key,
+                feedback=comment.body or "",
+                author=comment.author or "",
+            ):
+                # Another pass (or an earlier tick of this one) already took it.
+                skipped += 1
+                continue
+
+            logger.info(
+                "bloy_dev_agent: %s có feedback mới từ %s, bắt đầu vòng sửa lại",
+                issue.key, comment.author or "không rõ người",
+            )
+            outcome = run_issue(
+                client,
+                record,
+                monorepo=monorepo,
+                target_repo=target_repo,
+                statuses=statuses,
+                working_status=working_status,
+                done_status=done_status,
+                error_status=error_status,
+                timeout_minutes=timeout_minutes,
+                # Never on a revision round: the branch already has an open
+                # merge request, and asking GitLab for a second one on the same
+                # branch is how a ticket ends up with two.
+                create_mr=False,
+                blocked_status=blocked_status,
+                skill_packs_root=skill_packs_root,
+                enabled_skill_names=enabled_skill_names,
+                feedback=comment,
+            )
+            if outcome.run_id:
+                store.attach_feedback_run(comment.id, outcome.run_id)
+            outcomes.append(outcome)
+
+    return {
+        "project_id": project_id,
+        "mode": "feedback (revision round)",
+        "picked": len(outcomes),
+        "succeeded": sum(1 for o in outcomes if o.ok),
+        "already_claimed": skipped,
         "issues": [asdict(o) for o in outcomes],
     }

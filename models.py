@@ -213,3 +213,105 @@ class BloyStagingToken(Base):
     created_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+
+
+class BloyLoopAttempt(Base):
+    """One generator+evaluator attempt inside a run's coding loop.
+
+    Persisted rather than kept only in the report because the report is a
+    comment on a ticket — editable, deletable, and gone from this service's view
+    the moment someone tidies the thread. When a reviewer asks why a ticket took
+    three attempts, or why the loop stopped, these rows are the answer.
+    """
+
+    __tablename__ = "plugin_bloy_loop_attempt"
+    __table_args__ = (UniqueConstraint("run_id", "attempt", name="uq_bloy_loop_attempt"),)
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    run_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    attempt: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    #: ``pass`` / ``fail`` / ``needs_human``, or empty when the evaluator never
+    #: produced a readable verdict. Empty is meaningful: it is what the stall
+    #: guard counts, so it must be distinguishable from a real ``fail``.
+    verdict: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    score: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    #: The evaluator's own words about what was missing — the text that was fed
+    #: to the next attempt verbatim, kept so a human can see what the agent was
+    #: actually told rather than inferring it.
+    missing: Mapped[str | None] = mapped_column(Text, nullable=True)
+    generator_ok: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+
+    tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    cost_usd: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    created_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
+class BloyVerificationReceipt(Base):
+    """One verify command **this service** ran, and what it returned.
+
+    The point of the table is provenance, not convenience: an agent can write
+    "tests pass" into its answer, but it cannot write a row here — only the
+    service that executed the command does. The completion decision reads these,
+    never the agent's claim (see ``features/coding/receipts.py``).
+
+    ``output`` is the tail of what the command printed; ``output_sha256`` is over
+    the *whole* output, so a truncated row can still be shown to be the one that
+    was produced.
+    """
+
+    __tablename__ = "plugin_bloy_verification_receipt"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    run_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    batch_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    repo: Mapped[str] = mapped_column(String(128), nullable=False)
+    command: Mapped[str] = mapped_column(Text, nullable=False)
+    exit_code: Mapped[int] = mapped_column(Integer, nullable=False, default=-1)
+    #: 1 only when the command ran AND exited zero. A command that never ran
+    #: (container died, call raised) has ``ok=0`` and a non-empty ``error``,
+    #: which is a different fact from "the check failed".
+    ok: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    duration_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    output_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    output: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
+class BloyFeedbackRound(Base):
+    """One reviewer comment that started a revision round.
+
+    Keyed by the comment that triggered it, uniquely, and written **before** any
+    work starts. That ordering is the whole safety property: the Twenty poll
+    runs every few minutes while a revision takes many of them, so without a
+    claim recorded up front the same comment would start a second container on
+    the next tick, and a third on the one after that.
+    """
+
+    __tablename__ = "plugin_bloy_feedback_round"
+
+    #: The triggering comment's Twenty id. Primary key, so a duplicate insert
+    #: fails rather than needing a read-then-write nobody can make atomic.
+    comment_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+
+    issue_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    issue_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    #: The pipeline run this round started, once it has one.
+    run_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    #: First 500 chars of what the reviewer asked for, so the dashboard can show
+    #: why a finished ticket went back to work without another Twenty call.
+    feedback: Mapped[str | None] = mapped_column(Text, nullable=True)
+    author: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+    created_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )

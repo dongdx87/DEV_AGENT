@@ -195,10 +195,25 @@ class PassRunner:
             return True
 
     def _run(self, config: dict) -> None:
+        """Drive one pass of the requested kind.
+
+        The two entry points are called by name here rather than looked up in a
+        table of function objects: a table built at import time captures the
+        originals, so patching ``service.run_pass_from_config`` — which is how
+        this class is tested at all — would silently have no effect.
+        """
+        mode = str(config.get("mode") or "new")
+        if mode not in ("new", "feedback"):
+            self._last_summary = {"error": f"mode không hợp lệ: {mode!r}"}
+            return
         try:
-            self._last_summary = run_pass_from_config(config)
+            self._last_summary = (
+                run_feedback_from_config(config)
+                if mode == "feedback"
+                else run_pass_from_config(config)
+            )
         except Exception as exc:  # noqa: BLE001 — a crash must not kill the service
-            logger.exception("bloy_dev_agent: pass failed")
+            logger.exception("bloy_dev_agent: pass %r failed", mode)
             self._last_summary = {"error": str(exc)}
 
 
@@ -344,6 +359,64 @@ def run_pass_from_config(config: dict) -> dict:
         done_status=pick(store.SETTING_DONE_STATUS, pipeline.DEFAULT_DONE_STATUS),
         error_status=pick(store.SETTING_ERROR_STATUS, pipeline.DEFAULT_ERROR_STATUS),
         blocked_status=pick(store.SETTING_BLOCKED_STATUS, pipeline.DEFAULT_BLOCKED_STATUS),
+        max_issues=int(config.get("max_issues") or 1),
+        timeout_minutes=timeout or 30,
+        skill_packs_root=skills_root,
+        enabled_skill_names=enabled_names,
+    )
+
+
+def run_feedback_from_config(config: dict) -> dict:
+    """Scan the review columns for reviewer feedback and act on it.
+
+    Same shape as :func:`run_pass_from_config` and deliberately a *separate*
+    pass rather than a step inside it: a feedback round costs a container just
+    like new work does, and an operator who wants only one of the two (say,
+    finishing the review queue before picking up anything new) has to be able
+    to run them apart. Both go through the same single-flight
+    :class:`PassRunner`, so they never share a host with each other either.
+    """
+    saved = store.get_settings()
+
+    def pick(key: str, fallback: str) -> str:
+        return str(config.get(key) or saved.get(key) or fallback)
+
+    project_id = pick(store.SETTING_PROJECT_ID, "")
+    if not project_id:
+        return {"error": "project_id chưa được cấu hình"}
+
+    monorepo = Path(pick(store.SETTING_MONOREPO, str(pipeline.default_monorepo())))
+    if not monorepo.is_dir():
+        return {"error": f"Repository path không tồn tại: {monorepo}"}
+
+    try:
+        timeout = int(pick(store.SETTING_TIMEOUT_MINUTES, "0") or 0)
+    except ValueError:
+        timeout = 0
+
+    skills_root = Path(
+        pick(store.SETTING_SKILLS_ROOT, str(skill_packs.DEFAULT_SKILLS_ROOT))
+    )
+    enabled_names = tuple(
+        skill_packs.parse_enabled(saved.get(store.SETTING_ENABLED_SKILLS) or "")
+    )
+
+    done_status = pick(store.SETTING_DONE_STATUS, pipeline.DEFAULT_DONE_STATUS)
+    blocked_status = pick(store.SETTING_BLOCKED_STATUS, pipeline.DEFAULT_BLOCKED_STATUS)
+
+    return pipeline.run_feedback_pass(
+        _twenty_client(),
+        project_id=project_id,
+        monorepo=monorepo,
+        target_repo=pick(store.SETTING_TARGET_REPO, pipeline.DEFAULT_TARGET_REPO),
+        # Both columns a reported ticket can be sitting in. A reviewer
+        # correcting work the evaluator rejected is as much a revision request
+        # as one correcting work it accepted — arguably more.
+        review_statuses=tuple(dict.fromkeys((done_status, blocked_status))),
+        working_status=pick(store.SETTING_WORKING_STATUS, pipeline.DEFAULT_WORKING_STATUS),
+        done_status=done_status,
+        error_status=pick(store.SETTING_ERROR_STATUS, pipeline.DEFAULT_ERROR_STATUS),
+        blocked_status=blocked_status,
         max_issues=int(config.get("max_issues") or 1),
         timeout_minutes=timeout or 30,
         skill_packs_root=skills_root,
@@ -503,6 +576,12 @@ def create_app() -> FastAPI:
                 events=[asdict(e) for e in events],
                 live=run.state == BloyPipelineRun.STATE_RUNNING,
                 artifacts=artifacts,
+                # The loop's own record. This is the page a reviewer lands on
+                # before deciding whether to trust a merge request, and the
+                # receipts are the only part of it the agent did not author —
+                # so they belong here, not only in the Twenty comment.
+                attempts=store.attempts_for(run_id),
+                receipts=store.receipts_for(run_id),
             ),
         )
 
@@ -535,6 +614,10 @@ def create_app() -> FastAPI:
                 title=f"Settings · {PAGE_TITLE}",
                 settings=store.get_settings(),
                 max_attempts=store.max_attempts(),
+                loop_enabled=store.loop_enabled(),
+                feedback_enabled=store.feedback_enabled(),
+                loop_budget=store.loop_budget(),
+                verify_commands=store.verify_commands_raw(),
                 repos=list(workspace.KNOWN_REPOS),
                 counts=preflight.summarise(checks),
             ),
@@ -552,6 +635,12 @@ def create_app() -> FastAPI:
         blocked_status: str = Form(default=""),
         timeout_minutes: str = Form(default=""),
         comments_disabled: str = Form(default=""),
+        loop_enabled: str = Form(default=""),
+        loop_max_attempts: str = Form(default=""),
+        loop_max_tokens: str = Form(default=""),
+        loop_max_cost_usd: str = Form(default=""),
+        verify_commands: str = Form(default=""),
+        feedback_enabled: str = Form(default=""),
     ):
         store.save_settings(
             {
@@ -568,6 +657,23 @@ def create_app() -> FastAPI:
                 # the stored value must still change to "" on that submit, or
                 # turning the toggle back off from the form would do nothing.
                 store.SETTING_COMMENTS_DISABLED: "on" if comments_disabled.strip() else "",
+                store.SETTING_LOOP_MAX_ATTEMPTS: loop_max_attempts.strip(),
+                store.SETTING_LOOP_MAX_TOKENS: loop_max_tokens.strip(),
+                store.SETTING_LOOP_MAX_COST_USD: loop_max_cost_usd.strip(),
+                # Kept verbatim, newlines and all: this is the operator's
+                # verify command list, and the parser that has to reject a
+                # malformed line lives with the runner (see
+                # features/coding/receipts.py) so a mistake is loud there
+                # rather than silently trimmed here.
+                store.SETTING_VERIFY_COMMANDS: verify_commands.strip(),
+                # These two default to ON, so unlike comments_disabled above
+                # the *absent* checkbox has to be stored as an explicit "off"
+                # rather than as "" — an empty value would read back as the
+                # default, and the toggle could never be turned off.
+                store.SETTING_LOOP_ENABLED: "on" if loop_enabled.strip() else "off",
+                store.SETTING_FEEDBACK_ENABLED: (
+                    "on" if feedback_enabled.strip() else "off"
+                ),
             }
         )
         return _redirect("/settings")
@@ -796,6 +902,16 @@ def create_app() -> FastAPI:
         RUNNER.try_start({"max_issues": count})
         return _redirect("/")
 
+    @app.post("/run-feedback")
+    def run_feedback_now(max_issues: str = Form(default="1")):
+        """Work the review queue: reviewer comments become revision rounds."""
+        try:
+            count = max(1, min(3, int(max_issues)))
+        except ValueError:
+            count = 1
+        RUNNER.try_start({"mode": "feedback", "max_issues": count})
+        return _redirect("/")
+
     # ---------------- API ----------------
 
     @app.get("/api/health")
@@ -841,6 +957,24 @@ def create_app() -> FastAPI:
         which is a normal answer, not an error.
         """
         config = payload or {}
+        accepted = RUNNER.try_start(config)
+        return {
+            "accepted": accepted,
+            "busy": RUNNER.busy,
+            "detail": "" if accepted else "một pass đang chạy, bỏ qua lượt này",
+            "active": [_run_view(r) for r in store.active_runs()],
+        }
+
+    @app.post("/api/pipeline/feedback")
+    def trigger_feedback(payload: dict | None = None):
+        """Start a feedback pass. The BAM routine action calls this too.
+
+        Same single-flight rule and same immediate answer as
+        ``/api/pipeline/run``: ``accepted: false`` means a pass of either kind
+        was already running, which is a normal answer rather than an error.
+        """
+        config = dict(payload or {})
+        config["mode"] = "feedback"
         accepted = RUNNER.try_start(config)
         return {
             "accepted": accepted,

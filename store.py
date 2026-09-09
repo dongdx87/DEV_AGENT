@@ -17,7 +17,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from bloy_dev_agent.db import SessionLocal
-from bloy_dev_agent.models import BloyPipelineRun, BloySetting
+from bloy_dev_agent.models import (
+    BloyFeedbackRound,
+    BloyLoopAttempt,
+    BloyPipelineRun,
+    BloySetting,
+    BloyVerificationReceipt,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +50,28 @@ SETTING_DONE_STATUS = "done_status"
 SETTING_ERROR_STATUS = "error_status"
 SETTING_BLOCKED_STATUS = "blocked_status"
 SETTING_TIMEOUT_MINUTES = "timeout_minutes"
+
+#: The coding loop (see ``features/coding``). ``loop_max_attempts`` is how
+#: many generator+evaluator attempts one run may spend before it stops and
+#: reports; the others bound what a run may cost regardless of how many
+#: attempts that turns out to be. Distinct from SETTING_MAX_ATTEMPTS, which
+#: counts whole *runs* (separate containers, separate comments) against one
+#: issue — this one counts turns inside a single run.
+SETTING_LOOP_ENABLED = "loop_enabled"
+SETTING_LOOP_MAX_ATTEMPTS = "loop_max_attempts"
+SETTING_LOOP_MAX_TOKENS = "loop_max_tokens"
+SETTING_LOOP_MAX_COST_USD = "loop_max_cost_usd"
+
+#: Commands this service runs itself to verify an attempt, one
+#: ``<repo>: <command>`` per line. NEVER supplied by a ticket or by the
+#: agent — see ``features/coding/receipts.py`` for why that boundary is the
+#: whole point. Empty means no trusted verification is available, and the
+#: evaluator is told so explicitly rather than left to assume.
+SETTING_VERIFY_COMMANDS = "verify_commands"
+
+#: Whether a reviewer comment on a reported ticket starts a revision round
+#: (see ``features/feedback.py``).
+SETTING_FEEDBACK_ENABLED = "feedback_enabled"
 
 #: Twenty credentials. Stored here so a new machine is configured from the
 #: browser rather than by editing someone else's ``.env`` — the environment is
@@ -138,6 +166,269 @@ def sandbox_stage_retries() -> int:
         return max(1, int(raw))
     except (TypeError, ValueError):
         return DEFAULT_SANDBOX_STAGE_RETRIES
+
+
+def _flag(key: str, default: bool) -> bool:
+    """Read a boolean setting, honouring both spellings of off."""
+    raw = get_settings().get(key, "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "on", "yes"}
+
+
+def loop_enabled() -> bool:
+    """Whether a run goes through the coding loop or the old single shot.
+
+    On by default: the loop is what makes an unattended run's "done" mean
+    anything (an independent evaluator had to fail to reject it). Kept as a
+    switch anyway, because when the evaluator itself is what is misbehaving,
+    turning it off is how an operator gets tickets moving again tonight rather
+    than after a deploy.
+    """
+    return _flag(SETTING_LOOP_ENABLED, True)
+
+
+def feedback_enabled() -> bool:
+    """Whether reviewer comments start revision rounds."""
+    return _flag(SETTING_FEEDBACK_ENABLED, True)
+
+
+def loop_budget():
+    """The configured :class:`LoopBudget`, with the module defaults for blanks.
+
+    Imported lazily so :mod:`bloy_dev_agent.store` stays importable by the
+    service's own admin pages without dragging in the sandbox stack.
+    """
+    from bloy_dev_agent.features.coding.budget import (
+        DEFAULT_MAX_ATTEMPTS as LOOP_DEFAULT_ATTEMPTS,
+    )
+    from bloy_dev_agent.features.coding.budget import LoopBudget
+
+    values = get_settings()
+
+    def _int(key: str, default: int | None) -> int | None:
+        raw = str(values.get(key, "") or "").strip()
+        if not raw:
+            return default
+        try:
+            parsed = int(raw)
+        except ValueError:
+            return default
+        # 0 means "no cap" for the resource limits, which is why this returns
+        # None rather than clamping to 1 the way an attempt count would.
+        return parsed if parsed > 0 else None
+
+    def _float(key: str) -> float | None:
+        raw = str(values.get(key, "") or "").strip()
+        if not raw:
+            return None
+        try:
+            parsed = float(raw)
+        except ValueError:
+            return None
+        return parsed if parsed > 0 else None
+
+    attempts = _int(SETTING_LOOP_MAX_ATTEMPTS, LOOP_DEFAULT_ATTEMPTS) or LOOP_DEFAULT_ATTEMPTS
+    return LoopBudget(
+        max_attempts=max(1, attempts),
+        max_tokens=_int(SETTING_LOOP_MAX_TOKENS, None),
+        max_cost_usd=_float(SETTING_LOOP_MAX_COST_USD),
+    )
+
+
+def verify_commands_raw() -> str:
+    """The operator's verify command list, verbatim.
+
+    Returned unparsed on purpose: the parser lives with the runner that has to
+    reject a malformed line loudly (see ``features/coding/receipts.py``), and a
+    settings accessor that quietly dropped bad lines would turn a configuration
+    mistake into silently reduced verification.
+    """
+    return str(get_settings().get(SETTING_VERIFY_COMMANDS, "") or "")
+
+
+# ---------------------------------------------------------------------------
+# Loop attempts and verification receipts
+# ---------------------------------------------------------------------------
+
+
+def record_attempt(
+    run_id: str,
+    *,
+    attempt: int,
+    verdict: str = "",
+    score: float = 0.0,
+    missing: str = "",
+    generator_ok: bool = True,
+    tokens: int = 0,
+    cost_usd: float = 0.0,
+) -> None:
+    """Persist one loop attempt. Best-effort — bookkeeping never aborts work."""
+    session = SessionLocal()
+    try:
+        session.merge(
+            BloyLoopAttempt(
+                id=f"{run_id}-{attempt}",
+                run_id=run_id,
+                attempt=attempt,
+                verdict=verdict or None,
+                score=f"{score:.2f}",
+                missing=(missing or "")[:4000] or None,
+                generator_ok=1 if generator_ok else 0,
+                tokens=int(tokens or 0),
+                cost_usd=f"{float(cost_usd or 0.0):.4f}",
+                created_at=_now(),
+            )
+        )
+        session.commit()
+    except Exception:  # noqa: BLE001
+        session.rollback()
+        logger.exception("bloy_dev_agent: could not record loop attempt %s/%s", run_id, attempt)
+    finally:
+        session.close()
+
+
+def record_receipts(run_id: str, *, attempt: int, batch) -> None:
+    """Persist a batch of verification receipts.
+
+    These rows are the authoritative record of what ran — the JSON file the
+    evaluator reads inside the container is only a projection of them (see
+    ``features/coding/receipts.py``). Written after the batch completes rather
+    than per command, so one failed insert cannot leave a half-recorded batch
+    that reads as fewer checks than actually ran.
+    """
+    if batch is None or not batch.receipts:
+        return
+    session = SessionLocal()
+    try:
+        for receipt in batch.receipts:
+            session.add(
+                BloyVerificationReceipt(
+                    id=receipt.id,
+                    run_id=run_id,
+                    attempt=attempt,
+                    batch_id=batch.batch_id or None,
+                    repo=receipt.repo,
+                    command=receipt.command,
+                    exit_code=receipt.exit_code,
+                    ok=1 if (receipt.ran and receipt.ok) else 0,
+                    error=receipt.error or None,
+                    duration_ms=receipt.duration_ms,
+                    output_sha256=receipt.output_sha256,
+                    output=receipt.output or None,
+                    created_at=_now(),
+                )
+            )
+        session.commit()
+    except Exception:  # noqa: BLE001
+        session.rollback()
+        logger.exception("bloy_dev_agent: could not record receipts for %s", run_id)
+    finally:
+        session.close()
+
+
+def receipts_for(run_id: str) -> list[BloyVerificationReceipt]:
+    """Every receipt recorded for a run, oldest attempt first."""
+    session = SessionLocal()
+    try:
+        return list(
+            session.query(BloyVerificationReceipt)
+            .filter(BloyVerificationReceipt.run_id == run_id)
+            .order_by(
+                BloyVerificationReceipt.attempt.asc(),
+                BloyVerificationReceipt.created_at.asc(),
+            )
+            .all()
+        )
+    finally:
+        session.close()
+
+
+def attempts_for(run_id: str) -> list[BloyLoopAttempt]:
+    """Every loop attempt recorded for a run, in order."""
+    session = SessionLocal()
+    try:
+        return list(
+            session.query(BloyLoopAttempt)
+            .filter(BloyLoopAttempt.run_id == run_id)
+            .order_by(BloyLoopAttempt.attempt.asc())
+            .all()
+        )
+    finally:
+        session.close()
+
+
+# ---------------------------------------------------------------------------
+# Feedback rounds
+# ---------------------------------------------------------------------------
+
+
+def claim_feedback(
+    *,
+    comment_id: str,
+    issue_id: str,
+    issue_key: str,
+    feedback: str = "",
+    author: str = "",
+) -> bool:
+    """Claim a reviewer comment as this service's to act on. False if already taken.
+
+    The claim is an INSERT on a primary key, committed before any work starts.
+    That is deliberate and it is the only thing that makes the feedback poll
+    safe: it runs every few minutes while a revision round takes many of them,
+    so a read-then-decide would start a second container for the same comment on
+    the very next tick. Let the database refuse the duplicate instead.
+    """
+    if not comment_id:
+        return False
+    session = SessionLocal()
+    try:
+        session.add(
+            BloyFeedbackRound(
+                comment_id=comment_id,
+                issue_id=issue_id,
+                issue_key=issue_key,
+                feedback=(feedback or "")[:500] or None,
+                author=(author or "")[:255] or None,
+                created_at=_now(),
+            )
+        )
+        session.commit()
+        return True
+    except Exception:  # noqa: BLE001 — a duplicate is the expected outcome here
+        session.rollback()
+        return False
+    finally:
+        session.close()
+
+
+def attach_feedback_run(comment_id: str, run_id: str) -> None:
+    """Record which run a claimed feedback comment ended up starting."""
+    session = SessionLocal()
+    try:
+        row = session.get(BloyFeedbackRound, comment_id)
+        if row is not None:
+            row.run_id = run_id
+            session.commit()
+    except Exception:  # noqa: BLE001
+        session.rollback()
+        logger.exception("bloy_dev_agent: could not attach run %s to feedback", run_id)
+    finally:
+        session.close()
+
+
+def feedback_rounds(limit: int = 30) -> list[BloyFeedbackRound]:
+    """Recent revision rounds, newest first, for the dashboard."""
+    session = SessionLocal()
+    try:
+        return list(
+            session.query(BloyFeedbackRound)
+            .order_by(BloyFeedbackRound.created_at.desc())
+            .limit(max(1, limit))
+            .all()
+        )
+    finally:
+        session.close()
 
 
 # ---------------------------------------------------------------------------
@@ -436,6 +727,48 @@ def blocked_issues() -> list[BloyPipelineRun]:
             seen.add(run.issue_id)
             out.append(run)
     return out
+
+
+def last_merge_requests(issue_id: str) -> list[tuple[str, str]]:
+    """The merge requests the newest successful run on this issue produced.
+
+    Needed by a revision round: it pushes to the branch that already has an
+    open merge request, so it must NOT ask GitLab to open a second one — but
+    the report it posts still has to carry the link, or the reviewer who asked
+    for the change has nothing to click. Reading it back from the run that
+    opened it is the only place that link still exists once the round starts.
+    """
+    session = SessionLocal()
+    try:
+        row = (
+            session.query(BloyPipelineRun)
+            .filter(
+                BloyPipelineRun.issue_id == issue_id,
+                BloyPipelineRun.state == BloyPipelineRun.STATE_SUCCESS,
+            )
+            .order_by(BloyPipelineRun.finished_at.desc())
+            .first()
+        )
+    finally:
+        session.close()
+    if row is None:
+        return []
+    if row.merge_requests_json:
+        try:
+            import json
+
+            pairs = json.loads(row.merge_requests_json)
+        except ValueError:
+            pairs = []
+        if isinstance(pairs, list):
+            return [
+                (str(pair[0]), str(pair[1]))
+                for pair in pairs
+                if isinstance(pair, (list, tuple)) and len(pair) == 2
+            ]
+    if row.merge_request_url:
+        return [(row.target_repo or "", str(row.merge_request_url))]
+    return []
 
 
 def reset_attempts(issue_id: str) -> int:

@@ -50,7 +50,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 
-from bloy_dev_agent.features import agent_log, skill_packs
+from bloy_dev_agent.features import agent_log, claude_accounts, skill_packs
 
 logger = logging.getLogger(__name__)
 
@@ -530,13 +530,53 @@ def _token_export(staging_token: str) -> str:
     return f" BLOY_STAGING_TOKEN={shlex.quote(staging_token)}"
 
 
-def claude_flags(implement: bool, staging: bool = False) -> str:
-    """CLI flags for the run.
+#: Turn modes a session can run. ``implement`` writes code; ``analyse`` may
+#: only read (the original read-only pass); ``evaluate`` is the independent
+#: grader — read plus Bash so it can run the project's tests, but deliberately
+#: NO edit tool, so the turn that judges the work cannot quietly fix it and
+#: then pass it. See ``features/coding/evaluator.py``.
+MODE_IMPLEMENT = "implement"
+MODE_ANALYSE = "analyse"
+MODE_EVALUATE = "evaluate"
+
+
+def _prompt_script(prompt: str, path: str = PROMPT_PATH) -> str:
+    """Overwrite the prompt file between turns of one session.
+
+    Separate from :func:`_setup_script` because the container is created once
+    and then prompted several times (generator, evaluator, retry): only the
+    prompt changes, and re-running the whole setup would recreate the user and
+    re-push the credentials for no reason. Base64 for the same reason as the
+    setup script — a ticket body is human-written text and must never be
+    interpolated into a shell command.
+    """
+    return "\n".join(
+        [
+            "set -e",
+            f"printf '%s' {shlex.quote(_b64(prompt))} | base64 -d > {path}",
+            f"chmod 644 {path}",
+        ]
+    )
+
+
+def claude_flags(implement: bool, staging: bool = False, mode: str = "") -> str:
+    """CLI flags for one turn.
 
     ``--dangerously-skip-permissions`` is the point of the container: the agent
     must not stop for a confirmation nobody is there to answer, and the mounts
     already bound what it can reach. Analysis mode gets neither that flag nor
     any write tool, so a misconfigured routine cannot edit code by accident.
+
+    ``mode`` (one of :data:`MODE_IMPLEMENT` / :data:`MODE_ANALYSE` /
+    :data:`MODE_EVALUATE`) supersedes ``implement`` when given; the boolean is
+    kept as the first positional argument because every existing caller and
+    test passes it that way. :data:`MODE_EVALUATE` is the one genuinely new
+    shape: read tools **plus Bash** (an evaluator that cannot run the test
+    suite can only grade by reading, which is exactly the self-report problem
+    the evaluator exists to fix) and **no edit tool at all**, so the turn that
+    judges the work is structurally unable to repair it and pass itself. Note
+    it deliberately omits ``--permission-mode plan``: plan mode would block the
+    very Bash calls this mode is granted for.
 
     ``staging`` appends ``--mcp-config <path> --strict-mcp-config`` — the only
     way that actually works to hand a non-interactive, single-shot ``claude
@@ -548,9 +588,13 @@ def claude_flags(implement: bool, staging: bool = False) -> str:
     nothing else gets a chance to auto-load either, so this stays the one and
     only source of MCP servers for a staging run.
     """
-    base = "--dangerously-skip-permissions" if implement else (
-        "--allowedTools Read Grep Glob --permission-mode plan"
-    )
+    effective = mode or (MODE_IMPLEMENT if implement else MODE_ANALYSE)
+    if effective == MODE_EVALUATE:
+        base = "--allowedTools Read Grep Glob Bash"
+    elif effective == MODE_IMPLEMENT:
+        base = "--dangerously-skip-permissions"
+    else:
+        base = "--allowedTools Read Grep Glob --permission-mode plan"
     if not staging:
         return base
     return f"{base} --mcp-config {MCP_CONFIG_PATH} --strict-mcp-config"
@@ -560,18 +604,25 @@ def _b64(data: str) -> str:
     return base64.b64encode(data.encode("utf-8")).decode("ascii")
 
 
-def _filtered_credentials() -> str:
+def _filtered_credentials(path: Path | None = None) -> str:
     """Only the Claude subscription login, never the other MCP servers' OAuth.
 
     ``~/.claude/.credentials.json`` also holds refresh tokens for
     bloy-knowledge, bloy-data, bloy-diagnose and Atlassian's MCP servers —
     none of which this pipeline's sandbox ever talks to. Handing all of that
     to every sandboxed run was strictly more than the run needed.
+
+    ``path`` selects *which* login to filter, so a run can use one of the
+    accounts BAM's AI Code Factory provisioned rather than only this host's
+    default (see :mod:`bloy_dev_agent.features.claude_accounts`). Omitted, it
+    is :data:`HOST_CLAUDE_CREDENTIALS` — the behaviour before accounts were
+    selectable, and what keeps this function callable with no arguments.
     """
-    if not HOST_CLAUDE_CREDENTIALS.is_file():
+    source = path if path is not None else HOST_CLAUDE_CREDENTIALS
+    if not source.is_file():
         return ""
     try:
-        data = json.loads(HOST_CLAUDE_CREDENTIALS.read_text(encoding="utf-8"))
+        data = json.loads(source.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return ""
     oauth = data.get("claudeAiOauth")
@@ -777,6 +828,7 @@ def _setup_script(
     run_id: str = "",
     staging: bool = False,
     shopify_auth_dir: Path | None = None,
+    credentials_path: Path | None = None,
 ) -> str:
     """Create the agent user, install its Claude login, and drop the prompt in.
 
@@ -788,7 +840,7 @@ def _setup_script(
     claude_json = _filtered_claude_json(
         HOST_CLAUDE_JSON.read_text(encoding="utf-8") if HOST_CLAUDE_JSON.exists() else ""
     )
-    credentials = _filtered_credentials()
+    credentials = _filtered_credentials(credentials_path)
     skill_lines: list[str] = []
     if enabled_skills and skill_packs_root is not None:
         skills_dir = agent_log.container_skills_dir(WORKTREE_MOUNT, run_id or "adhoc")
@@ -858,6 +910,367 @@ def _setup_script(
     )
 
 
+def image_for(image: str, staging: bool) -> str:
+    """Which container image a run actually gets.
+
+    A staging-verify run needs Chromium pre-installed, so it switches to
+    :data:`STAGING_IMAGE` — but only when the caller left the image at the
+    default, so an explicit override (a test, a one-off) is never silently
+    replaced. Shared by every entry point rather than repeated: the single-shot
+    path and the loop path picking different images for the same ticket would be
+    a difference nobody could see from the outside.
+    """
+    return STAGING_IMAGE if staging and image == DEFAULT_IMAGE else image
+
+
+def auth_dir_for(shopify_auth_dir: Path | None, staging: bool) -> Path | None:
+    """The captured Shopify session directory a run should mount, if any.
+
+    Defaults to :data:`SHOPIFY_AUTH_DIR` whenever ``staging`` is true and no
+    override is given — there is only ever one such directory on a host, so
+    requiring every caller to repeat it would just be a chance to forget it (and
+    a staging run that forgot it hits a login wall it cannot pass).
+    """
+    if shopify_auth_dir is not None:
+        return shopify_auth_dir
+    return SHOPIFY_AUTH_DIR if staging else None
+
+
+@dataclass
+class TurnResult:
+    """What one ``claude -p`` turn produced.
+
+    ``output`` is recovered from the stream log rather than stdout, because
+    stdout is where the JSON stream itself goes; see :meth:`SandboxSession.turn`.
+    """
+
+    ok: bool
+    output: str
+    exit_code: int = 0
+    tokens: int = 0
+    cost_usd: float = 0.0
+    #: Where this turn's stream-json landed on the host, when it was logged.
+    log_path: Path | None = None
+
+
+class SandboxSession:
+    """One container, prepared once, prompted many times.
+
+    Why this exists: the pipeline used to create a container, run a single
+    ``claude -p``, and kill it. An unattended loop needs several turns against
+    the *same* worktree — a generator, then an independent evaluator that has to
+    see the diff the generator just made, then a retry that continues from it —
+    and each of those in its own container would mean re-mounting, re-installing
+    the login, re-copying the skill packs, and (worse) an evaluator that cannot
+    see uncommitted work because it is looking at a different container's view.
+
+    So the container's lifecycle is now the *run's* lifecycle. Everything about
+    what it can reach is unchanged: the same mounts, the same egress policy, the
+    same unprivileged user, and the SSH key still never enters it (committing
+    and pushing stay on the host, in :mod:`bloy_dev_agent.features.workspace`).
+
+    Used as an async context manager so the container is killed on every exit
+    path, including an exception mid-loop::
+
+        async with SandboxSession(...) as session:
+            first = await session.turn(prompt)
+            ...
+    """
+
+    def __init__(
+        self,
+        *,
+        worktree: Path,
+        worktree_root: Path,
+        image: str = DEFAULT_IMAGE,
+        timeout_minutes: int = DEFAULT_TIMEOUT_MINUTES,
+        run_id: str = "",
+        monorepo: Path | None = None,
+        enabled_skills: list[skill_packs.SkillPack] | None = None,
+        skill_packs_root: Path | None = None,
+        staging: bool = False,
+        shopify_auth_dir: Path | None = None,
+        staging_token: str = "",
+        agent_repos_root: Path | None = None,
+        claude_config_dir: Path | None = None,
+    ) -> None:
+        self.worktree = worktree
+        self.worktree_root = worktree_root
+        self.image = image
+        self.timeout_minutes = timeout_minutes
+        self.run_id = run_id
+        self.monorepo = monorepo
+        self.enabled_skills = enabled_skills
+        self.skill_packs_root = skill_packs_root
+        self.staging = staging
+        self.shopify_auth_dir = shopify_auth_dir
+        self.staging_token = staging_token
+        self.agent_repos_root = agent_repos_root
+
+        #: Which provisioned Claude login this session pushes into the
+        #: container. Resolved once, here, rather than per turn: every turn of
+        #: one run must use the same account, or the run's own rate-limit
+        #: budget and its audit trail both stop meaning anything.
+        self.account = (
+            claude_accounts.ClaudeAccount(claude_config_dir.name, claude_config_dir)
+            if claude_config_dir is not None
+            else claude_accounts.resolve(run_id)
+        )
+
+        self.sandbox_id = ""
+        self.setup_output = ""
+        #: Set when the container came up but its setup script failed. The loop
+        #: reports this instead of prompting a container that has no login.
+        self.setup_error = ""
+        self._sandbox = None
+        self._chrome_profile: Path | None = None
+        self._prompt_written = False
+
+    # -- lifecycle ---------------------------------------------------------
+
+    @property
+    def workdir(self) -> str:
+        """The primary worktree's path *inside* the container."""
+        return container_path(self.worktree, self.worktree_root)
+
+    async def __aenter__(self) -> SandboxSession:
+        await self.open()
+        return self
+
+    async def __aexit__(self, *_exc) -> None:
+        await self.close()
+
+    async def open(self) -> None:
+        """Create the container and run the one-time setup script."""
+        from opensandbox import Sandbox
+
+        # Mount the filtered mirror, never the real monorepo — see
+        # sync_monorepo_mirror's docstring for why.
+        monorepo_mount = (
+            sync_monorepo_mirror(self.monorepo) if self.monorepo is not None else None
+        )
+
+        self._chrome_profile = (
+            _shopify_chrome_profile_path(self.shopify_auth_dir) if self.staging else None
+        )
+        if self._chrome_profile is not None:
+            _clear_stale_chrome_singleton_files(self._chrome_profile)
+
+        self._sandbox = await Sandbox.create(
+            self.image,
+            timeout=timedelta(minutes=self.timeout_minutes),
+            connection_config=_connection(),
+            volumes=_volumes(
+                self.worktree_root,
+                monorepo_mount,
+                self.skill_packs_root,
+                self.shopify_auth_dir,
+                self.agent_repos_root,
+            ),
+            metadata={"owner": OWNER_TAG, "run_id": self.run_id or "adhoc"},
+            network_policy=(
+                _network_policy(STAGING_EGRESS_ALLOW) if self.staging else None
+            ),
+            resource=STAGING_RESOURCE if self.staging else None,
+        )
+        self.sandbox_id = (
+            getattr(self._sandbox, "sandbox_id", "")
+            or getattr(self._sandbox, "id", "")
+        )
+        logger.info(
+            "bloy_dev_agent: sandbox %s working in %s", self.sandbox_id, self.workdir
+        )
+
+        # The setup script still takes a prompt because it writes PROMPT_PATH in
+        # the same pass; an empty one is fine and the first turn overwrites it.
+        setup = await self._sandbox.commands.run(
+            _setup_script(
+                "",
+                self.enabled_skills,
+                self.skill_packs_root,
+                self.run_id,
+                self.staging,
+                self.shopify_auth_dir,
+                self.account.credentials,
+            )
+        )
+        self.setup_output = _text(setup)
+        if "NO_CREDENTIALS" in self.setup_output:
+            logger.warning(
+                "bloy_dev_agent: no Claude credentials visible in the sandbox "
+                "(account %r at %s)", self.account.name, self.account.config_dir,
+            )
+        else:
+            logger.info(
+                "bloy_dev_agent: sandbox %s using Claude account %r",
+                self.sandbox_id, self.account.name,
+            )
+        if int(getattr(setup, "exit_code", 0) or 0) != 0:
+            self.setup_error = f"Sandbox setup failed:\n{self.setup_output}"
+
+    async def close(self) -> None:
+        """Kill the container. Never raises — a leaked sandbox must not mask a result."""
+        if self._sandbox is None:
+            return
+        try:
+            await self._sandbox.kill()
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "bloy_dev_agent: could not kill sandbox %s", self.sandbox_id
+            )
+        finally:
+            self._sandbox = None
+
+    # -- raw command surface ----------------------------------------------
+
+    async def run_as_root(self, command: str):
+        """Run a shell command as root inside the container."""
+        if self._sandbox is None:
+            raise SandboxError("sandbox is not open")
+        return await self._sandbox.commands.run(command)
+
+    async def run_as_agent(self, command: str, *, cwd: str = "") -> tuple[int, str]:
+        """Run a command as the unprivileged agent user; return (exit code, text).
+
+        The same ``su - "$u"`` shape the agent's own turns use, so a verify
+        command this service runs sees exactly the environment the agent saw —
+        same user, same PATH, same node. A check that only passes as root would
+        be a check that never reflected the run.
+        """
+        node_bin = f"{NVM_MOUNT}/versions/node/{NODE_VERSION}/bin"
+        inner = (
+            f"export PATH={node_bin}:$PATH CI=true; "
+            f"cd {shlex.quote(cwd or self.workdir)} && {command}"
+        )
+        execution = await self.run_as_root(
+            f'{RESOLVE_AGENT_USER}; su - "$u" -c {shlex.quote(inner)}'
+        )
+        return int(getattr(execution, "exit_code", 0) or 0), _text(execution)
+
+    async def push_file(self, path: str, content: str) -> None:
+        """Write ``content`` to ``path`` inside the container, world-readable.
+
+        Base64 on the way in for the same reason as the prompt: this carries
+        command output and JSON, neither of which survives being interpolated
+        into a shell command. World-readable because the agent user, not root,
+        is who reads it back.
+        """
+        await self.run_as_root(
+            "\n".join(
+                [
+                    "set -e",
+                    f"printf '%s' {shlex.quote(_b64(content))} | base64 -d "
+                    f"> {shlex.quote(path)}",
+                    f"chmod 644 {shlex.quote(path)}",
+                ]
+            )
+        )
+
+    async def read_file(self, path: str, *, limit: int = 200_000) -> str:
+        """Read a file back out of the container, or ``""`` when absent."""
+        execution = await self.run_as_root(
+            f"head -c {int(limit)} {shlex.quote(path)} 2>/dev/null || true"
+        )
+        return _text(execution)
+
+    # -- prompting ---------------------------------------------------------
+
+    async def turn(
+        self,
+        prompt: str,
+        *,
+        mode: str = MODE_IMPLEMENT,
+        log_path: Path | None = None,
+        append: bool = False,
+    ) -> TurnResult:
+        """Run one ``claude -p`` turn against this container's worktree.
+
+        ``log_path`` is a host path under the bind-mounted worktree root, so the
+        stream is readable *while* the turn runs — that is what the run detail
+        page tails. ``append`` keeps several turns of one run in a single log
+        (stream-json is one JSON object per line, so appending is well-formed,
+        and :func:`agent_log.final_text` scans backwards and therefore returns
+        the newest turn's answer).
+
+        stdout carries the JSON stream and must stay clean, so stderr goes to
+        its own file rather than being merged into it.
+        """
+        if self._sandbox is None:
+            raise SandboxError("sandbox is not open")
+
+        await self.run_as_root(_prompt_script(prompt))
+        self._prompt_written = True
+
+        redirect = ""
+        if log_path is not None:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            if not append or not log_path.exists():
+                log_path.write_text("", encoding="utf-8")
+            in_container = _container_path_for(log_path, self.worktree_root)
+            operator = ">>" if append else ">"
+            redirect = (
+                f" --output-format stream-json --verbose"
+                f" {operator} {shlex.quote(in_container)} 2> {shlex.quote(STDERR_PATH)}"
+            )
+
+        flags = claude_flags(mode == MODE_IMPLEMENT, staging=self.staging, mode=mode)
+        # Xvfb is started here, not in the setup script: it must still be
+        # running by the time `claude -p` spawns the Playwright MCP server as a
+        # child of *this* shell, and each `commands.run` is its own shell — a
+        # background process from an earlier call would not survive into this
+        # one. Started per turn for the same reason.
+        node_bin = f"{NVM_MOUNT}/versions/node/{NODE_VERSION}/bin"
+        inner = (
+            f"export PATH={node_bin}:$PATH CI=true"
+            f"{_token_export(self.staging_token)}; "
+            f"{_xvfb_prefix(self._chrome_profile is not None)}"
+            f"cd {shlex.quote(self.workdir)} && "
+            f"cat {PROMPT_PATH} | claude -p {flags}{redirect}"
+        )
+        execution = await self.run_as_root(
+            f'{RESOLVE_AGENT_USER}; su - "$u" -c {shlex.quote(inner)}'
+        )
+        exit_code = int(getattr(execution, "exit_code", 0) or 0)
+
+        if log_path is None:
+            return TurnResult(exit_code == 0, _text(execution), exit_code)
+
+        # The stream went to the log, so stdout is empty by design; the answer
+        # and any failure text have to be recovered from the file and stderr.
+        output = agent_log.final_text(log_path)
+        if not output:
+            stderr = await self.run_as_root(
+                f"tail -c 2000 {STDERR_PATH} 2>/dev/null"
+            )
+            output = _text(stderr) or _text(execution)
+        usage = agent_log.last_usage(log_path)
+        return TurnResult(
+            exit_code == 0,
+            output,
+            exit_code,
+            tokens=usage.get("total_tokens", 0),
+            cost_usd=usage.get("cost_usd", 0.0),
+            log_path=log_path,
+        )
+
+
+def _container_path_for(host_path: Path, worktree_root: Path) -> str:
+    """Where a host path under the worktree root appears inside the container.
+
+    Only the worktree root is bind-mounted, so a path outside it has no
+    container-side equivalent and that is a programming error, not a runtime
+    condition — hence the explicit raise rather than a silent fallback that
+    would send a run's log into a directory nobody ever reads.
+    """
+    try:
+        relative = host_path.relative_to(worktree_root)
+    except ValueError as exc:
+        raise SandboxError(
+            f"{host_path} is outside the mounted worktree root {worktree_root}"
+        ) from exc
+    return f"{WORKTREE_MOUNT}/{relative.as_posix()}"
+
+
 async def _run_async(
     *,
     prompt: str,
@@ -875,97 +1288,40 @@ async def _run_async(
     staging_token: str = "",
     agent_repos_root: Path | None = None,
 ) -> SandboxResult:
-    from opensandbox import Sandbox
+    """One prompt, one container — the original single-turn path.
 
-    workdir = container_path(worktree, worktree_root)
-    node_bin = f"{NVM_MOUNT}/versions/node/{NODE_VERSION}/bin"
-
-    # Mount the filtered mirror, never the real monorepo — see
-    # sync_monorepo_mirror's docstring for why.
-    monorepo_mount = sync_monorepo_mirror(monorepo) if monorepo is not None else None
-
-    chrome_profile = _shopify_chrome_profile_path(shopify_auth_dir) if staging else None
-    if chrome_profile is not None:
-        _clear_stale_chrome_singleton_files(chrome_profile)
-
-    # With a run id the agent streams its reasoning to a file on the shared
-    # volume, so the admin page can follow along while the container works.
-    host_log = agent_log.host_log_path(worktree_root, run_id) if run_id else None
-    if host_log is not None:
-        host_log.parent.mkdir(parents=True, exist_ok=True)
-        host_log.write_text("", encoding="utf-8")
-
-    sandbox = await Sandbox.create(
-        image,
-        timeout=timedelta(minutes=timeout_minutes),
-        connection_config=_connection(),
-        volumes=_volumes(
-            worktree_root, monorepo_mount, skill_packs_root, shopify_auth_dir,
-            agent_repos_root,
-        ),
-        metadata={"owner": OWNER_TAG, "run_id": run_id or "adhoc"},
-        network_policy=_network_policy(STAGING_EGRESS_ALLOW) if staging else None,
-        resource=STAGING_RESOURCE if staging else None,
-    )
-    sandbox_id = getattr(sandbox, "sandbox_id", "") or getattr(sandbox, "id", "")
-    logger.info("bloy_dev_agent: sandbox %s working in %s", sandbox_id, workdir)
-
-    try:
-        setup = await sandbox.commands.run(
-            _setup_script(
-                prompt, enabled_skills, skill_packs_root, run_id, staging, shopify_auth_dir
-            )
+    Kept as a thin wrapper over :class:`SandboxSession` rather than a second
+    implementation: the shell assembly, the mounts and the credential filtering
+    are the parts that actually break in production, and having two copies of
+    them is how they drift apart.
+    """
+    async with SandboxSession(
+        worktree=worktree,
+        worktree_root=worktree_root,
+        image=image,
+        timeout_minutes=timeout_minutes,
+        run_id=run_id,
+        monorepo=monorepo,
+        enabled_skills=enabled_skills,
+        skill_packs_root=skill_packs_root,
+        staging=staging,
+        shopify_auth_dir=shopify_auth_dir,
+        staging_token=staging_token,
+        agent_repos_root=agent_repos_root,
+    ) as session:
+        if session.setup_error:
+            return SandboxResult(False, session.setup_error, session.sandbox_id, 1)
+        log_path = (
+            agent_log.host_log_path(worktree_root, run_id) if run_id else None
         )
-        setup_output = _text(setup)
-        if "NO_CREDENTIALS" in setup_output:
-            logger.warning("bloy_dev_agent: no Claude credentials visible in the sandbox")
-        if int(getattr(setup, "exit_code", 0) or 0) != 0:
-            return SandboxResult(
-                False, f"Sandbox setup failed:\n{setup_output}", sandbox_id, 1
-            )
-
-        flags = claude_flags(implement, staging=staging)
-        redirect = ""
-        if run_id:
-            log_in_container = agent_log.container_log_path(WORKTREE_MOUNT, run_id)
-            # stdout carries the JSON stream and must stay clean, so stderr goes
-            # to its own file rather than being merged into it.
-            redirect = (
-                f" --output-format stream-json --verbose"
-                f" > {shlex.quote(log_in_container)} 2> {shlex.quote(STDERR_PATH)}"
-            )
-        # Started here, not in the setup script: it must still be running by
-        # the time `claude -p` spawns the Playwright MCP server as a child of
-        # *this* shell, and the setup script and this command run as
-        # separate `sandbox.commands.run` calls — a background process from
-        # the first would not survive into the second.
-        xvfb_prefix = _xvfb_prefix(chrome_profile is not None)
-        inner = (
-            f"export PATH={node_bin}:$PATH CI=true{_token_export(staging_token)}; "
-            f"{xvfb_prefix}"
-            f"cd {shlex.quote(workdir)} && "
-            f"cat {PROMPT_PATH} | claude -p {flags}{redirect}"
+        turn = await session.turn(
+            prompt,
+            mode=MODE_IMPLEMENT if implement else MODE_ANALYSE,
+            log_path=log_path,
         )
-        execution = await sandbox.commands.run(
-            f'{RESOLVE_AGENT_USER}; su - "$u" -c {shlex.quote(inner)}'
+        return SandboxResult(
+            turn.ok, turn.output, session.sandbox_id, turn.exit_code
         )
-        exit_code = int(getattr(execution, "exit_code", 0) or 0)
-
-        if host_log is None:
-            return SandboxResult(exit_code == 0, _text(execution), sandbox_id, exit_code)
-
-        # The stream went to the log, so stdout is empty by design; the answer
-        # and any failure text have to be recovered from the file and stderr.
-        output = agent_log.final_text(host_log)
-        if not output:
-            stderr = await sandbox.commands.run(f"tail -c 2000 {STDERR_PATH} 2>/dev/null")
-            output = _text(stderr) or _text(execution)
-        return SandboxResult(exit_code == 0, output, sandbox_id, exit_code)
-    finally:
-        try:
-            await sandbox.kill()
-        except Exception:  # noqa: BLE001 — a leaked sandbox must not mask the result
-            logger.warning("bloy_dev_agent: could not kill sandbox %s", sandbox_id)
 
 
 def _run_coroutine(factory):
@@ -1029,12 +1385,8 @@ def run_in_sandbox(
     directory on a host, so requiring every caller to repeat it would just be
     a chance to forget it. Pass an explicit path (e.g. in tests) to override.
     """
-    effective_image = STAGING_IMAGE if staging and image == DEFAULT_IMAGE else image
-    effective_auth_dir = (
-        shopify_auth_dir
-        if shopify_auth_dir is not None
-        else (SHOPIFY_AUTH_DIR if staging else None)
-    )
+    effective_image = image_for(image, staging)
+    effective_auth_dir = auth_dir_for(shopify_auth_dir, staging)
     try:
         return _run_coroutine(
             lambda: _run_async(

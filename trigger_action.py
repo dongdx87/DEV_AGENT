@@ -21,6 +21,13 @@ logger = logging.getLogger(__name__)
 
 ACTION_KEY = "bloy_run_twenty_issues"
 
+#: The revision-round action. A separate routine on purpose: a feedback
+#: round costs a container exactly like new work, and the two want
+#: different cadences — new issues arrive all day, while reviewer comments
+#: only appear after someone has read a merge request. Both go through the
+#: service's single-flight runner, so they never collide on the host.
+FEEDBACK_ACTION_KEY = "bloy_run_feedback_rounds"
+
 
 def _config_fields() -> list[RoutineActionField]:
     return [
@@ -56,7 +63,13 @@ def _int(config: dict[str, Any], key: str, default: int) -> int:
         return default
 
 
-def _run(context: dict[str, Any]) -> str:
+def _post(context: dict[str, Any], path: str) -> str:
+    """Ask the service to start a pass at ``path`` and report what it answered.
+
+    Shared by both actions: only the endpoint differs, and duplicating the
+    error handling is how one of them would quietly stop reporting a down
+    service.
+    """
     import httpx
 
     from bloy_dev_agent.plugin import TRIGGER_TIMEOUT, service_url
@@ -68,7 +81,7 @@ def _run(context: dict[str, Any]) -> str:
         if value:
             payload[key] = value
 
-    url = f"{service_url()}/api/pipeline/run"
+    url = f"{service_url()}{path}"
     record = context.get("record_request")
     if callable(record):
         record(f"POST {url}\n{json.dumps(payload, ensure_ascii=False)}")
@@ -96,6 +109,14 @@ def _run(context: dict[str, Any]) -> str:
     return json.dumps(body, ensure_ascii=False)
 
 
+def _run(context: dict[str, Any]) -> str:
+    return _post(context, "/api/pipeline/run")
+
+
+def _run_feedback(context: dict[str, Any]) -> str:
+    return _post(context, "/api/pipeline/feedback")
+
+
 def build_actions() -> list[RoutineAction]:
     return [
         RoutineAction(
@@ -109,5 +130,19 @@ def build_actions() -> list[RoutineAction]:
             order=10,
             config_fields=_config_fields(),
             run=_run,
-        )
+        ),
+        RoutineAction(
+            key=FEEDBACK_ACTION_KEY,
+            display_name="BLOY: work reviewer feedback",
+            description=(
+                "Looks for reviewer comments written after the agent's own report "
+                "on a ticket and works each one as a revision round — same branch, "
+                "same merge request. A comment is only ever acted on once. Schedule "
+                "this less often than the issue pass: it only has work to do after "
+                "a human has read something."
+            ),
+            order=20,
+            config_fields=_config_fields(),
+            run=_run_feedback,
+        ),
     ]

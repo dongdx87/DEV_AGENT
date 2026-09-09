@@ -23,6 +23,23 @@ from bloy_dev_agent.features import pipeline, workspace
 
 
 @pytest.fixture(autouse=True)
+def single_shot_pipeline(monkeypatch):
+    """Pin these tests to the single-shot sandbox path.
+
+    Everything in this module stubs ``run_in_sandbox`` and asserts what the
+    pipeline does *around* the agent — claiming, no-change detection, pushing,
+    reporting. That behaviour is shared by both execution modes, so testing it
+    once through the cheaper one is deliberate; the coding loop's own
+    behaviour is pinned in ``test_coding_loop.py``.
+
+    Without this the loop (which is the default, see ``store.loop_enabled``)
+    would try to create a real container and fail on a host with no
+    ``~/.sandbox.toml``.
+    """
+    monkeypatch.setattr(pipeline.store, "loop_enabled", lambda: False)
+
+
+@pytest.fixture(autouse=True)
 def no_agent_repos_mirror(monkeypatch, tmp_path):
     """Every test in this module builds its own throwaway "monorepo" fixture
     and expects workspace.prepare() to branch from it. default_agent_repos_root()

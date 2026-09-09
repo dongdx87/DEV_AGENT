@@ -50,6 +50,111 @@
       </div>
     </section>
 
+    {# ---------- coding loop ---------- #}
+    <section class="rounded-2xl border border-indigo-300 bg-indigo-50/40 shadow-sm p-5 space-y-4">
+      <div>
+        <h2 class="text-base font-semibold text-indigo-900">Vòng lặp tự kiểm (AI tự làm hết)</h2>
+        <p class="mt-1 text-sm text-indigo-800 max-w-prose">
+          Mỗi lần thử gồm: agent viết code → <span class="font-medium">service tự chạy</span>
+          các lệnh verify bên dưới → một agent <span class="font-medium">evaluator riêng</span>
+          (chỉ được đọc, không có quyền sửa) đọc diff + kết quả lệnh + ảnh staging
+          rồi cho verdict. Trượt thì thử lại kèm đúng lời evaluator nói còn thiếu gì.
+          Không có bước người duyệt ở giữa — người chỉ xem output ở cuối.
+        </p>
+      </div>
+
+      <label class="flex items-start gap-3 cursor-pointer">
+        <input type="checkbox" name="loop_enabled" value="on"
+               {% if loop_enabled %}checked{% endif %}
+               class="mt-1 h-4 w-4 rounded border-indigo-300 text-indigo-600 focus:ring-indigo-500/40">
+        <span>
+          <span class="block text-sm font-semibold text-indigo-900">Bật vòng lặp</span>
+          <span class="mt-1 block text-sm text-indigo-800 max-w-prose">
+            Tắt thì quay về cách chạy cũ: một lượt <code class="rounded bg-white/70 px-1">claude -p</code>
+            duy nhất, không có evaluator, không có verify — dùng khi chính evaluator
+            đang hỏng và cần đẩy task đi ngay.
+          </span>
+        </span>
+      </label>
+
+      <div class="grid grid-cols-1 gap-4 sm:grid-cols-3">
+        <div>
+          <label for="loop_max_attempts" class="block text-sm font-medium text-indigo-900">
+            Số lần thử trong 1 run
+          </label>
+          <input id="loop_max_attempts" name="loop_max_attempts" type="number" min="1" max="10"
+                 value="{{ loop_budget.max_attempts }}"
+                 class="mt-1 w-full rounded-lg border border-indigo-300 bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/30 focus:border-indigo-500">
+          <p class="mt-1 text-xs text-indigo-700">
+            Khác "số lần thử mỗi issue" ở trên: ô đó đếm cả <em>run</em> riêng biệt,
+            ô này đếm lượt trong cùng một container. Container sống lâu gấp số này
+            lần timeout sandbox.
+          </p>
+        </div>
+        <div>
+          <label for="loop_max_tokens" class="block text-sm font-medium text-indigo-900">
+            Trần token mỗi run
+          </label>
+          <input id="loop_max_tokens" name="loop_max_tokens" type="number" min="0"
+                 value="{{ settings.get('loop_max_tokens', '') }}" placeholder="không giới hạn"
+                 class="mt-1 w-full rounded-lg border border-indigo-300 bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/30 focus:border-indigo-500">
+          <p class="mt-1 text-xs text-indigo-700">Trống hoặc 0 = không chặn.</p>
+        </div>
+        <div>
+          <label for="loop_max_cost_usd" class="block text-sm font-medium text-indigo-900">
+            Trần chi phí mỗi run (USD)
+          </label>
+          <input id="loop_max_cost_usd" name="loop_max_cost_usd" type="text"
+                 value="{{ settings.get('loop_max_cost_usd', '') }}" placeholder="không giới hạn"
+                 class="mt-1 w-full rounded-lg border border-indigo-300 bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/30 focus:border-indigo-500">
+          <p class="mt-1 text-xs text-indigo-700">
+            Chạm trần là dừng hẳn và báo cho người, không âm thầm kết thúc.
+          </p>
+        </div>
+      </div>
+
+      <div>
+        <label for="verify_commands" class="block text-sm font-medium text-indigo-900">
+          Lệnh verify — service tự chạy, agent không được khai thay
+        </label>
+        <textarea id="verify_commands" name="verify_commands" rows="5"
+                  placeholder="shopify-app-loyalty-api: npm test&#10;shopify-app-loyalty-cms: npm run build"
+                  class="mt-1 w-full rounded-lg border border-indigo-300 bg-white px-3 py-2 font-mono text-xs focus:outline-none focus:ring-2 focus:ring-indigo-500/30 focus:border-indigo-500">{{ verify_commands }}</textarea>
+        <p class="mt-1 text-xs text-indigo-700 max-w-prose">
+          Mỗi dòng một lệnh, dạng <code class="rounded bg-white/70 px-1">&lt;repo&gt;: &lt;lệnh&gt;</code>.
+          Dòng bắt đầu bằng <code class="rounded bg-white/70 px-1">#</code> là ghi chú.
+          <span class="font-medium">Một dòng phải là đúng một lệnh</span> — có
+          <code class="rounded bg-white/70 px-1">&amp;&amp;</code>,
+          <code class="rounded bg-white/70 px-1">;</code>, <code class="rounded bg-white/70 px-1">|</code>
+          hay backtick thì cả danh sách bị coi là sai và run đó chạy mà
+          <em>không</em> có verify (evaluator được thông báo rõ điều đó).
+          Chỉ những repo mà lượt thử đó thực sự sửa mới bị chạy lệnh.
+          Kết quả lưu thành receipt trong DB — evaluator đọc được nhưng không ghi được,
+          nên nó không thể kết luận PASS khi lệnh còn trượt.
+        </p>
+      </div>
+    </section>
+
+    {# ---------- feedback ---------- #}
+    <section class="rounded-2xl border border-emerald-300 bg-emerald-50/40 shadow-sm p-5">
+      <label class="flex items-start gap-3 cursor-pointer">
+        <input type="checkbox" name="feedback_enabled" value="on"
+               {% if feedback_enabled %}checked{% endif %}
+               class="mt-1 h-4 w-4 rounded border-emerald-300 text-emerald-600 focus:ring-emerald-500/40">
+        <span>
+          <span class="block text-sm font-semibold text-emerald-900">Nhận feedback của reviewer</span>
+          <span class="mt-1 block text-sm text-emerald-800 max-w-prose">
+            Reviewer chỉ cần <span class="font-medium">comment lên issue</span> sau
+            báo cáo của agent — không cần đổi cột, không cần bấm gì. Lượt quét
+            feedback sẽ lấy comment mới nhất làm yêu cầu, sửa tiếp
+            <span class="font-medium">trên đúng branch và đúng merge request cũ</span>
+            (không mở MR thứ hai). Comment kiểu "ok", "thanks" bị bỏ qua, và mỗi
+            comment chỉ chạy một lần.
+          </span>
+        </span>
+      </label>
+    </section>
+
     {# ---------- comments ---------- #}
     <section class="rounded-2xl border border-slate-200 bg-white shadow-sm p-5">
       <label class="flex items-start gap-3 cursor-pointer">

@@ -21,8 +21,8 @@ even when this service is down.
 
 | | |
 |---|---|
-| **Does** | Sync Twenty ↔ its own pipeline · runs agents in per-ticket sandboxes · Shopify staging-verify (screenshots on a real store) · its own skill-pack selection, settings and status pages |
-| **Does not** | Depend on `agent_team` or any other plugin · alter another plugin's tables · require BAM to be up to keep a run alive |
+| **Does** | Sync Twenty ↔ its own pipeline · runs agents in per-ticket sandboxes · self-checking generator/evaluator loop with service-run verification · reviewer-feedback revision rounds · Shopify staging-verify (screenshots on a real store) · its own skill-pack selection, settings and status pages |
+| **Does not** | Depend on `agent_team` or any other plugin · alter another plugin's tables · require BAM to be up to keep a run alive · stop for a human mid-run |
 
 ## Install (development)
 
@@ -51,6 +51,107 @@ mode. Same checklist SETUP.md walks through by hand.
 |---|---|
 | `BLOY_TWENTY_BASE_URL` | Twenty API base URL |
 | `BLOY_TWENTY_API_KEY` | API key bound to a narrow role and a dedicated bot workspace member |
+| `AI_CODE_CLAUDE_CONFIG_BASES` | BAM's own var: roots (`:`-separated) holding provisioned Claude config dirs |
+| `BLOY_CLAUDE_CONFIG_DIR` | Pin every run to one Claude account, bypassing discovery |
+
+Everything about the loop and the feedback rounds is configured on the
+service's **Settings** page rather than by env var, because it is operational
+policy an on-call person changes, not deployment wiring: `loop_enabled`,
+`loop_max_attempts`, `loop_max_tokens`, `loop_max_cost_usd`,
+`verify_commands`, `feedback_enabled`.
+
+## The coding loop
+
+A run is not one `claude -p` any more. Each **attempt** is:
+
+```
+generator turn    the agent writes code in the ticket's worktree
+verify commands   THIS SERVICE runs the operator's command list itself,
+                  in the same container, and stores receipts
+evaluator turn    a separate agent — read + Bash, NO edit tool — reads the
+                  diff, the receipts and the staging screenshots, and returns
+                  a JSON verdict
+controller        pass -> done | fail -> another attempt carrying the
+                  evaluator's own "what is missing" text | out of budget -> stop
+```
+
+All of it in **one container** per run: the evaluator has to see the
+generator's uncommitted diff, and a retry has to continue from work already on
+disk. The container's timeout is therefore scaled by the attempt cap.
+
+**There is no human approval step inside a run.** The agent works the ticket to
+a stop on its own; a person enters at the end, reading a merge request an
+independent evaluator already tried to reject. Every outcome that is not
+`complete` (capped, stalled, needs_human, budget) routes the ticket to a human
+rather than finishing quietly — and still opens its merge request, because work
+that exists is work a reviewer should be able to look at. Unaccepted work lands
+in the blocked column, never beside verified work.
+
+### Why the service runs the verify commands, not the agent
+
+Nothing stops a coding agent from writing "✅ tests pass" into its answer, and
+the old report matched on exactly that kind of self-authored string. So the
+command list is a **setting an operator configured once** — never from a ticket,
+never from the agent — and this service executes it and stores the result. The
+evaluator reads a projection of those receipts inside the container but cannot
+write them, and a `pass` verdict is **overruled** when a receipt still says a
+command failed.
+
+Configure it on the Settings page, one `<repo>: <command>` per line:
+
+```
+shopify-app-loyalty-api: npm test
+shopify-app-loyalty-cms: npm run build
+```
+
+One line must be exactly one command. An `&&`, `;`, `|` or backtick makes the
+whole list invalid, and the run proceeds with **no** verification while telling
+the evaluator so explicitly — silently running a subset would be worse. Only
+repos an attempt actually changed get their commands run.
+
+Budget guards (`loop_max_attempts`, `loop_max_tokens`, `loop_max_cost_usd`) are
+on the same page. Hitting any of them is a hard stop that reports back, and the
+evaluator's own token spend counts against them — it is a real agent run.
+
+## Reviewer feedback
+
+A reviewer who disagrees just **comments on the ticket**. No column to change,
+no button. The feedback pass looks for a comment written after this service's
+own last report and works it as a revision round:
+
+* the comment is the authoritative instruction, outranking the description;
+* the same worktree and branch, so the existing merge request is updated
+  rather than a second one opened;
+* each comment is claimed in the database before any work, so the poll running
+  again five minutes later cannot start a second container for it;
+* the agent's own reports are marked and skipped — otherwise the report ending
+  a revision round would read as new feedback and the ticket would work itself
+  forever;
+* bare acknowledgements ("ok", "thanks", 👍) are ignored.
+
+Both the review column and the blocked column are scanned: a human explaining
+what went wrong on work the evaluator rejected is the most useful input this
+pipeline can get.
+
+It runs as its own routine (`BLOY: work reviewer feedback`) or from
+`POST /api/pipeline/feedback` — deliberately separate from the new-work pass,
+since it only has anything to do after somebody has read a merge request.
+
+## Claude accounts
+
+The Claude login comes from the accounts BAM's **AI Code Factory** already
+provisioned: any directory holding a `.credentials.json` under
+`AI_CODE_CLAUDE_CONFIG_BASES` (BAM's own env var, read from the `.env` this
+service already loads). Runs are spread across them by a hash of the run id, so
+an unattended loop spending several turns per ticket is not stuck behind one
+subscription's rate limit, while a single run keeps one account across all its
+turns.
+
+Reused by **directory contract, not by import** — the same way skill packs are,
+and for the same reason: this service has to boot with BAM absent. The
+consequence is that the pool's `enabled`/`weight` flags live in BAM's database
+and are *not* honoured here; pin one account with `BLOY_CLAUDE_CONFIG_DIR` if
+that matters. Nothing discovered falls back to `~/.claude`, exactly as before.
 
 ## Staging-verify
 

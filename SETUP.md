@@ -277,6 +277,73 @@ Sau khi có skill trong kho, bật cho sandbox ở trang riêng của service n�
 
 ---
 
+## 5b. Vòng lặp tự kiểm và lệnh verify (bắt buộc cấu hình một lần)
+
+Mặc định mỗi run chạy **vòng lặp**: agent viết code → *service tự chạy* lệnh
+verify → một agent evaluator riêng chấm → trượt thì thử lại kèm đúng lời
+evaluator nói còn thiếu gì. Không có bước người duyệt ở giữa; người chỉ xem
+output ở cuối.
+
+Mở `/settings`, mục **Vòng lặp tự kiểm**:
+
+| Ô | Ý nghĩa | Gợi ý |
+|---|---|---|
+| Bật vòng lặp | Tắt thì về cách chạy cũ (một `claude -p`, không evaluator) | bật |
+| Số lần thử trong 1 run | Lượt generator+evaluator trong **cùng một container** | 2–3 |
+| Trần token / chi phí mỗi run | Chạm là dừng hẳn và báo cho người | tuỳ ngân sách |
+| Lệnh verify | Danh sách lệnh **service tự chạy**, mỗi dòng `<repo>: <lệnh>` | xem dưới |
+
+Ô **Lệnh verify** là phần quan trọng nhất và cũng là phần dễ bỏ sót nhất — để
+trống thì vòng lặp vẫn chạy nhưng không có bằng chứng nào ngoài lời agent nói,
+và evaluator được thông báo rõ là "không có receipt, đừng kết luận là test đã
+pass". Ví dụ:
+
+```
+# API: unit test đủ nhanh để chạy mỗi lượt
+shopify-app-loyalty-api: npm test
+# CMS: build bắt lỗi type, rẻ hơn chạy cả e2e
+shopify-app-loyalty-cms: npm run build
+```
+
+Ba luật cần biết:
+
+1. **Một dòng phải là đúng một lệnh.** Có `&&`, `;`, `|` hay backtick thì *cả
+   danh sách* bị coi là sai và run đó chạy mà không verify — cố tình như vậy,
+   vì "một phần lệnh bạn cấu hình đã chạy" là kết quả không ai xử lý được.
+   Cần nhiều lệnh thì tách thành nhiều dòng.
+2. **Chỉ repo mà lượt đó thực sự sửa mới bị chạy lệnh** — ticket chỉ sửa API
+   không phải trả tiền cho test suite của CMS.
+3. **Danh sách này không bao giờ đến từ ticket hay từ agent.** Đó là toàn bộ
+   lý do nó tồn tại: agent viết được "✅ tests pass" vào câu trả lời, nhưng
+   không ghi được một receipt. Verdict `pass` bị **phủ quyết** nếu còn receipt
+   trượt.
+
+Lệnh chạy trong container, dưới đúng user và PATH mà agent dùng, tại worktree
+của repo tương ứng. Timeout mỗi lệnh 15 phút. Kết quả lưu vào bảng
+`plugin_bloy_verification_receipt` và hiện ở trang chi tiết run.
+
+### Vòng feedback của reviewer
+
+Bật ở mục **Nhận feedback của reviewer** (mặc định bật). Reviewer chỉ cần
+comment lên issue sau báo cáo của agent — không cần đổi cột. Cần thêm **một
+routine thứ hai** trong BAM để nó thực sự chạy:
+
+| Routine | Action | Cadence gợi ý |
+|---|---|---|
+| Việc mới | `BLOY: run Twenty issues` | 2–5 phút |
+| Feedback | `BLOY: work reviewer feedback` | 10–15 phút |
+
+Feedback chỉ có việc sau khi có người đọc merge request, nên chạy thưa hơn.
+Hai routine dùng chung cơ chế single-flight của service nên không bao giờ
+chạy chồng nhau. Chạy tay được bằng `POST /api/pipeline/feedback` hoặc nút
+trên dashboard.
+
+Vòng feedback sửa **trên đúng branch và merge request cũ**, không mở MR thứ
+hai. Mỗi comment chỉ chạy một lần (claim vào DB trước khi làm việc), và báo
+cáo của agent có marker nên không bị hiểu là feedback mới.
+
+---
+
 ## 6. Staging-verify (tuỳ chọn, khuyến nghị bật ở production)
 
 Khi 1 ticket đụng tới `shopify-app-loyalty-cms`, pipeline tự cho sandbox thêm
@@ -388,6 +455,16 @@ BLOY_STOREFRONT_PASSWORD=1                                     # mặc định �
 ---
 
 ## Tổng hợp biến môi trường
+
+> Cấu hình vòng lặp, lệnh verify và feedback **không** nằm ở đây — chúng ở
+> trang `/settings` (xem § 5b), vì đó là policy vận hành người on-call đổi,
+> không phải wiring lúc deploy.
+
+| Biến | Ý nghĩa |
+|---|---|
+| `AI_CODE_CLAUDE_CONFIG_BASES` | Biến của **BAM**: các thư mục gốc (cách nhau bằng `:`) chứa config dir Claude mà AI Code Factory đã provision. Dùng chung theo *contract thư mục*, không import — service này phải boot được khi BAM tắt. |
+| `BLOY_CLAUDE_CONFIG_DIR` | Ghim mọi run vào đúng một account Claude, bỏ qua discovery. Dùng khi BAM đã disable một account (cờ `enabled`/`weight` nằm trong DB của BAM và **không** được đọc ở đây). |
+
 
 | Biến | Mặc định | Ghi chú |
 |---|---|---|

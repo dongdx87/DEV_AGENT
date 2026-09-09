@@ -220,3 +220,66 @@ def progress(path: Path) -> dict:
             (e.tool for e in reversed(events) if e.kind == KIND_TOOL and e.tool), ""
         ),
     }
+
+
+def last_usage(path: Path) -> dict:
+    """Token and cost totals from the newest ``result`` event in the log.
+
+    Read straight off the stream rather than tracked in Python: ``claude -p``
+    already reports the authoritative numbers for the turn it just finished, and
+    a second tally kept here could only ever disagree with them.
+
+    Returns zeros when the log has no result event yet (a turn still running, or
+    one killed before it finished). Zeros are the honest answer there — the loop
+    budget must never be *credited* for a turn whose cost is unknown, and it
+    must never be charged a guess either.
+
+    Only the last result is read on purpose: when several turns of one run share
+    a log (see ``SandboxSession.turn(append=True)``), each turn's usage is
+    folded into the ledger right after that turn, so summing the whole file
+    would count every earlier turn again.
+    """
+    if not path.exists():
+        return {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "cost_usd": 0.0}
+
+    payload: dict = {}
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    candidate = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(candidate, dict) and candidate.get("type") == "result":
+                    payload = candidate
+    except OSError:
+        logger.exception("bloy_dev_agent: could not read usage from %s", path)
+        return {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "cost_usd": 0.0}
+
+    usage = payload.get("usage")
+    usage = usage if isinstance(usage, dict) else {}
+
+    def _int(key: str) -> int:
+        try:
+            return max(0, int(usage.get(key) or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    input_tokens = _int("input_tokens")
+    output_tokens = _int("output_tokens")
+    # Cache reads are real input the provider billed for, so they belong in the
+    # total the budget is measured against — the CLI reports them separately.
+    total = input_tokens + output_tokens + _int("cache_read_input_tokens")
+    try:
+        cost = max(0.0, float(payload.get("total_cost_usd") or 0.0))
+    except (TypeError, ValueError):
+        cost = 0.0
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total,
+        "cost_usd": cost,
+    }

@@ -132,6 +132,86 @@
   </section>
   {% endif %}
 
+  {# ---------- the loop's own record ---------- #}
+  {% if attempts %}
+  <section class="rounded-2xl border border-indigo-200 bg-white shadow-sm">
+    <div class="px-5 py-4 border-b border-indigo-200 bg-indigo-50/40">
+      <h2 class="text-base font-semibold text-indigo-900">Vòng lặp tự kiểm</h2>
+      <p class="mt-1 text-sm text-indigo-800 max-w-prose">
+        Mỗi lần thử được một agent evaluator riêng (chỉ đọc, không có quyền sửa)
+        chấm. Verdict dưới đây là của evaluator, không phải agent tự khai.
+      </p>
+    </div>
+    <div class="divide-y divide-slate-100">
+      {% for attempt in attempts %}
+      <div class="px-5 py-4">
+        <div class="flex flex-wrap items-center gap-2">
+          <span class="text-sm font-semibold text-slate-900">Lần {{ attempt.attempt }}</span>
+          {% if attempt.verdict == "pass" %}
+            <span class="rounded-full bg-emerald-100 px-2 py-0.5 text-xs font-medium text-emerald-800">pass</span>
+          {% elif attempt.verdict == "needs_human" %}
+            <span class="rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-800">cần người quyết định</span>
+          {% elif attempt.verdict %}
+            <span class="rounded-full bg-rose-100 px-2 py-0.5 text-xs font-medium text-rose-800">fail</span>
+          {% else %}
+            <span class="rounded-full bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-600">không có verdict</span>
+          {% endif %}
+          <span class="text-xs font-mono text-slate-500">score {{ attempt.score or "—" }}</span>
+          {% if not attempt.generator_ok %}
+            <span class="text-xs text-rose-700">generator lỗi</span>
+          {% endif %}
+          <span class="ml-auto text-xs font-mono text-slate-400">
+            {{ "{:,}".format(attempt.tokens) }} token{% if attempt.cost_usd %} · ${{ attempt.cost_usd }}{% endif %}
+          </span>
+        </div>
+        {% if attempt.missing %}
+        <p class="mt-2 text-sm text-slate-600 whitespace-pre-line">{{ attempt.missing }}</p>
+        {% endif %}
+      </div>
+      {% endfor %}
+    </div>
+  </section>
+  {% endif %}
+
+  {# ---------- trusted verification receipts ---------- #}
+  {% if receipts %}
+  <section class="rounded-2xl border border-slate-200 bg-white shadow-sm">
+    <div class="px-5 py-4 border-b border-slate-200">
+      <h2 class="text-base font-semibold text-slate-900">Lệnh verify — service tự chạy</h2>
+      <p class="mt-1 text-sm text-slate-500 max-w-prose">
+        Do chính service này thực thi trong container, không phải agent. Agent
+        đọc được kết quả nhưng không ghi được, nên nó không thể kết luận PASS
+        khi một lệnh ở đây còn trượt.
+      </p>
+    </div>
+    <div class="divide-y divide-slate-100">
+      {% for receipt in receipts %}
+      <div class="px-5 py-3">
+        <div class="flex flex-wrap items-center gap-2">
+          {% if receipt.ok %}
+            <span class="rounded bg-emerald-100 px-1.5 py-0.5 text-xs font-medium text-emerald-800">PASS</span>
+          {% elif receipt.error %}
+            <span class="rounded bg-slate-200 px-1.5 py-0.5 text-xs font-medium text-slate-700">KHÔNG CHẠY ĐƯỢC</span>
+          {% else %}
+            <span class="rounded bg-rose-100 px-1.5 py-0.5 text-xs font-medium text-rose-800">FAIL ({{ receipt.exit_code }})</span>
+          {% endif %}
+          <code class="text-xs text-slate-800">{{ receipt.repo }}: {{ receipt.command }}</code>
+          <span class="ml-auto text-xs font-mono text-slate-400">
+            lần {{ receipt.attempt }} · {{ receipt.duration_ms }}ms
+          </span>
+        </div>
+        {% if receipt.error %}
+        <p class="mt-1 text-xs text-slate-600">{{ receipt.error }}</p>
+        {% endif %}
+        {% if receipt.output and not receipt.ok %}
+        <pre class="mt-2 max-h-48 overflow-auto rounded bg-slate-50 p-3 text-xs text-slate-700">{{ receipt.output[-2000:] }}</pre>
+        {% endif %}
+      </div>
+      {% endfor %}
+    </div>
+  </section>
+  {% endif %}
+
   {# ---------- staging-verify screenshots ---------- #}
   {% if artifacts %}
   <section class="rounded-2xl border border-slate-200 bg-white shadow-sm">
