@@ -880,7 +880,15 @@ def _setup_script(
             f"chmod 644 {PROMPT_PATH}",
             *skill_lines,
             *mcp_lines,
-            f'chown -R {AGENT_UID}:{AGENT_GID} "$h"',
+            # -x/--one-file-system: $h can now contain a read-only bind mount
+            # nested under it (see _resolve_claude_bin_dirs — a native-install
+            # `claude` lands under $HOME's own tree, e.g. /root/.local/...), and
+            # chown cannot change ownership on a read-only mount. A bind mount
+            # is a distinct filesystem from stat's point of view, so -x simply
+            # never descends into it instead of aborting the whole script
+            # (this runs under `set -e`) on the first "Read-only file system"
+            # error — found live the moment the sandbox mount fix above landed.
+            f'chown -R -x {AGENT_UID}:{AGENT_GID} "$h"',
             'test -s "$h/.claude/.credentials.json" || echo NO_CREDENTIALS',
         ]
     )

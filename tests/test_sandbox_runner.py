@@ -132,6 +132,21 @@ def test_setup_adopts_an_existing_uid_instead_of_creating_a_second_user():
     assert 'if [ -z "$u" ]; then' in script
 
 
+def test_the_home_chown_never_descends_into_a_bind_mount():
+    """$h can now hold a read-only bind mount nested under it (a native-install
+    `claude` lands under $HOME's own tree — see _resolve_claude_bin_dirs).
+    `chown` cannot touch a read-only mount, and this script runs under
+    `set -e`, so without ``-x`` the very first such directory would abort the
+    whole setup script — found live the moment the sandbox mount fix landed.
+    """
+    script = sandbox_runner._setup_script("do the thing")
+
+    home_chown = next(line for line in script.splitlines() if line.strip().startswith("chown"))
+    assert home_chown.split() == [
+        "chown", "-R", "-x", f"{sandbox_runner.AGENT_UID}:{sandbox_runner.AGENT_GID}", '"$h"',
+    ]
+
+
 def test_the_monorepo_is_mounted_read_only_for_the_map(tmp_path):
     """CLAUDE.md lives at the monorepo root, outside every sub-project.
 
