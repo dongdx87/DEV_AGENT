@@ -14,7 +14,7 @@ Mount layout::
 
     /worktrees      <- host worktree root   (read-write, the only one)
     /monorepo       <- monorepo root        (read-only, CLAUDE.md + sibling projects)
-    /opt/nvm        <- host nvm             (read-only, node + the claude CLI)
+    /opt/claude-bin <- dir holding `claude` (read-only, only if the host has one)
     /skill-packs    <- shared skill store   (read-only, only if any pack is enabled)
 
 ``~/.claude`` is deliberately **not** mounted or copied wholesale — that
@@ -69,7 +69,7 @@ STAGING_IMAGE = "bloy-dev-agent/sandbox-chromium:v1"
 #: — a real staging-verify run hit exactly that: "Chromium distribution
 #: 'chrome' is not found at /opt/google/chrome/chrome", and the agent user has
 #: no permission to `npx playwright install chrome` to fix it itself. Pinned
-#: the same way NODE_VERSION is — bump this alongside sandbox_image/Dockerfile
+#: to an exact revision on purpose — bump this alongside sandbox_image/Dockerfile
 #: if it ever installs a different Playwright/Chromium revision.
 STAGING_CHROMIUM_EXECUTABLE = "/opt/ms-playwright/chromium-1237/chrome-linux64/chrome"
 
@@ -138,7 +138,10 @@ STAGING_EGRESS_ALLOW: tuple[str, ...] = (
 )
 
 WORKTREE_MOUNT = "/worktrees"
-NVM_MOUNT = "/opt/nvm"
+#: Where the host directory holding the ``claude`` executable (see
+#: _resolve_claude_bin_dir()) is mounted — a generic name on purpose, since
+#: that directory is not always an nvm one; see that function's docstring.
+CLAUDE_BIN_MOUNT = "/opt/claude-bin"
 #: Monorepo root, read-only, so the agent can read CLAUDE.md and sibling projects.
 MONOREPO_MOUNT = "/monorepo"
 
@@ -217,12 +220,7 @@ MONOREPO_MIRROR_EXCLUDES = (
 #: enabled — an empty mount would just be a mkdir nobody asked for.
 SKILLS_MOUNT = "/skill-packs"
 
-#: Node release that carries the Claude CLI on this host. Pinned rather than
-#: globbed because the container must not silently pick up a different one.
-NODE_VERSION = "v20.20.2"
-
 SANDBOX_CONFIG = Path.home() / ".sandbox.toml"
-HOST_NVM = Path.home() / ".nvm"
 HOST_CLAUDE_JSON = Path.home() / ".claude.json"
 #: Where the actual OAuth tokens live — never mounted or copied whole (see
 #: module docstring); only its ``claudeAiOauth`` key is ever read out of it.
@@ -392,12 +390,43 @@ def _clear_stale_chrome_singleton_files(profile: Path) -> None:
         (profile / name).unlink(missing_ok=True)
 
 
+def _resolve_claude_bin_dir() -> Path | None:
+    """Host directory holding ``claude`` — mounted into the sandbox and put on
+    PATH ahead of everything else, resolved the SAME way the Setup page's own
+    "Claude CLI" check does (``preflight.find_claude_binary()``: an explicit
+    ``BLOY_CLAUDE_BIN``, then plain ``PATH``, then the newest nvm-installed
+    copy) so the two can never again disagree about where it is.
+
+    They used to: this used to hardcode a specific nvm/node version and mount
+    the whole ``~/.nvm`` tree, independently of what the Setup check actually
+    looked at. That drifted from reality in two ways, both found live on a
+    fresh production install — an nvm-installed CLI under a DIFFERENT node
+    version than the pin (the check passed, the mount pointed at a directory
+    that did not exist), and Anthropic's native installer
+    (``curl -fsSL https://claude.ai/install.sh | bash``, a single
+    self-contained binary that needs no ``node`` runtime alongside it at all)
+    landing outside ``~/.nvm`` entirely — the check reported "ok" from plain
+    ``PATH``, but the sandbox mounted ``~/.nvm`` regardless and the container
+    failed with ``claude: command not found``. Mounting whatever directory
+    this same resolution actually found removes that whole class of drift.
+
+    Returns ``None`` when nothing is found on the host either — the honest
+    behaviour then is to mount nothing and leave PATH untouched, not to guess
+    at a directory that does not exist.
+    """
+    from bloy_dev_agent.preflight import find_claude_binary
+
+    binary = find_claude_binary()
+    return Path(binary).resolve().parent if binary else None
+
+
 def _volumes(
     worktree_root: Path,
     monorepo: Path | None = None,
     skill_packs_root: Path | None = None,
     shopify_auth_dir: Path | None = None,
     agent_repos_root: Path | None = None,
+    claude_bin_dir: Path | None = None,
 ):
     from opensandbox.models.sandboxes import Host, Volume
 
@@ -407,10 +436,16 @@ def _volumes(
             host=Host(path=str(worktree_root)),
             mount_path=WORKTREE_MOUNT,
         ),
-        Volume(
-            name="nvm", host=Host(path=str(HOST_NVM)), mount_path=NVM_MOUNT, read_only=True
-        ),
     ]
+    if claude_bin_dir is not None:
+        volumes.append(
+            Volume(
+                name="claude-cli",
+                host=Host(path=str(claude_bin_dir)),
+                mount_path=CLAUDE_BIN_MOUNT,
+                read_only=True,
+            )
+        )
 
     # workspace.prepare() branches worktrees from this mirror whenever it
     # exists, never from the developer's own checkout (see its own docstring).
@@ -878,7 +913,7 @@ async def _run_async(
     from opensandbox import Sandbox
 
     workdir = container_path(worktree, worktree_root)
-    node_bin = f"{NVM_MOUNT}/versions/node/{NODE_VERSION}/bin"
+    claude_bin_dir = _resolve_claude_bin_dir()
 
     # Mount the filtered mirror, never the real monorepo — see
     # sync_monorepo_mirror's docstring for why.
@@ -901,7 +936,7 @@ async def _run_async(
         connection_config=_connection(),
         volumes=_volumes(
             worktree_root, monorepo_mount, skill_packs_root, shopify_auth_dir,
-            agent_repos_root,
+            agent_repos_root, claude_bin_dir,
         ),
         metadata={"owner": OWNER_TAG, "run_id": run_id or "adhoc"},
         network_policy=_network_policy(STAGING_EGRESS_ALLOW) if staging else None,
@@ -940,8 +975,9 @@ async def _run_async(
         # separate `sandbox.commands.run` calls — a background process from
         # the first would not survive into the second.
         xvfb_prefix = _xvfb_prefix(chrome_profile is not None)
+        path_value = f"{CLAUDE_BIN_MOUNT}:$PATH" if claude_bin_dir is not None else "$PATH"
         inner = (
-            f"export PATH={node_bin}:$PATH CI=true{_token_export(staging_token)}; "
+            f"export PATH={path_value} CI=true{_token_export(staging_token)}; "
             f"{xvfb_prefix}"
             f"cd {shlex.quote(workdir)} && "
             f"cat {PROMPT_PATH} | claude -p {flags}{redirect}"

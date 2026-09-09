@@ -190,6 +190,48 @@ def test_no_agent_repos_root_given_mounts_nothing_extra(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Where the sandbox finds `claude` — must track the Setup page's own check
+# (preflight.find_claude_binary), not a second, independently-hardcoded guess.
+# Found live on a fresh production install: the old hardcoded nvm/node-version
+# mount silently diverged from what the Setup page had already verified, so
+# the check said "ok" while the sandbox still failed with
+# "claude: command not found".
+# ---------------------------------------------------------------------------
+
+
+def test_claude_bin_dir_is_the_parent_of_whatever_the_setup_check_found(monkeypatch, tmp_path):
+    binary = tmp_path / "some" / "install" / "claude"
+    binary.parent.mkdir(parents=True)
+    binary.touch()
+    monkeypatch.setattr("bloy_dev_agent.preflight.find_claude_binary", lambda: str(binary))
+
+    assert sandbox_runner._resolve_claude_bin_dir() == binary.parent
+
+
+def test_no_claude_binary_found_resolves_to_none(monkeypatch):
+    monkeypatch.setattr("bloy_dev_agent.preflight.find_claude_binary", lambda: "")
+
+    assert sandbox_runner._resolve_claude_bin_dir() is None
+
+
+def test_a_resolved_claude_bin_dir_is_mounted_read_only(tmp_path):
+    claude_dir = tmp_path / "claude-bin"
+    claude_dir.mkdir()
+
+    volumes = sandbox_runner._volumes(tmp_path / "wt", claude_bin_dir=claude_dir)
+
+    mount = next(v for v in volumes if v.mount_path == sandbox_runner.CLAUDE_BIN_MOUNT)
+    assert mount.read_only is True
+    assert mount.host.path == str(claude_dir)
+
+
+def test_no_claude_bin_dir_mounts_nothing_extra(tmp_path):
+    volumes = sandbox_runner._volumes(tmp_path / "wt", claude_bin_dir=None)
+
+    assert all(v.mount_path != sandbox_runner.CLAUDE_BIN_MOUNT for v in volumes)
+
+
+# ---------------------------------------------------------------------------
 # Credential filtering — a sandbox must never receive more than the Claude
 # subscription login. Confirmed live on this host: the raw files being
 # replaced here hold OAuth refresh tokens for four unrelated MCP servers and,
