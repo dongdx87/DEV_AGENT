@@ -34,7 +34,30 @@ TRIGGER_TIMEOUT = 15.0
 
 
 def service_url() -> str:
+    """Server-to-server address of the service — used by trigger_action.py's
+    call into ``/api/pipeline/run``, which runs inside BAM's OWN process (the
+    dedicated pm2 process driving this routine's scheduler). Correct as
+    ``http://localhost:8100`` whenever BAM and this service share a host,
+    which is the common case; see ``service_public_url()`` for the separate
+    address a browser needs.
+    """
     return os.environ.get("BLOY_AGENT_URL", DEFAULT_SERVICE_URL).rstrip("/")
+
+
+def service_public_url() -> str:
+    """Browser-facing address — the sidebar "BLOY Dev Agent" link.
+
+    Deliberately separate from service_url(): that one is correct as
+    ``http://localhost:8100`` for BAM's own server-to-server call into this
+    service, and exactly as wrong for a browser link as ``BAM_URL`` was for
+    the service's own "BAM console" link in service.py (same bug, same fix,
+    mirrored — see ``bam_public_url()`` there). A reverse proxy can even put
+    the two behind different origins entirely (e.g. a path prefix nginx
+    strips before forwarding server-to-server, but the browser must include).
+    Defaults to service_url() so a deployment that never sets this stays
+    byte-identical to today.
+    """
+    return os.environ.get("BLOY_AGENT_PUBLIC_URL", service_url()).rstrip("/")
 
 
 class BloyDevAgentPlugin(PluginBase):
@@ -59,7 +82,7 @@ class BloyDevAgentPlugin(PluginBase):
         return [
             MenuItem(
                 label="BLOY Dev Agent",
-                url=service_url(),
+                url=service_public_url(),
                 icon="cpu-chip",
             )
         ]
