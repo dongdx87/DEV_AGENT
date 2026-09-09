@@ -694,15 +694,26 @@ def create_app() -> FastAPI:
         monorepo = Path(saved.get(store.SETTING_MONOREPO) or pipeline.default_monorepo())
         try:
             if action == "write_sandbox_config":
-                message = setup_wizard.write_sandbox_config([
-                    str(monorepo),
-                    str(workspace.default_worktree_root()),
-                    str(Path.home() / ".nvm"),
-                    str(Path.home() / ".claude"),
-                    saved.get(store.SETTING_SKILLS_ROOT) or str(skill_packs.DEFAULT_SKILLS_ROOT),
-                    str(sandbox_runner.DEFAULT_MONOREPO_MIRROR),
-                    str(sandbox_runner.SHOPIFY_AUTH_DIR),
-                ])
+                # Built from the same function _setup_context() feeds its own
+                # check with (setup_wizard.required_host_paths) — this call
+                # used to keep its own hand-written copy of this list, which
+                # silently fell out of sync and dropped agent_repos_root, so
+                # the fix button rewrote the file still missing the one path
+                # the check was actually complaining about. See that
+                # function's own docstring.
+                message = setup_wizard.write_sandbox_config(
+                    setup_wizard.required_host_paths(
+                        monorepo=monorepo,
+                        worktree_root=workspace.default_worktree_root(),
+                        skill_packs_root=Path(
+                            saved.get(store.SETTING_SKILLS_ROOT)
+                            or str(skill_packs.DEFAULT_SKILLS_ROOT)
+                        ),
+                        monorepo_mirror=sandbox_runner.DEFAULT_MONOREPO_MIRROR,
+                        shopify_auth_dir=sandbox_runner.SHOPIFY_AUTH_DIR,
+                        agent_repos_root=workspace.default_agent_repos_root(),
+                    )
+                )
             elif action == "write_egress_mode":
                 message = setup_wizard.write_egress_mode()
             elif action == "start_sandbox_server":

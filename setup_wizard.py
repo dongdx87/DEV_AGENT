@@ -136,6 +136,56 @@ def _sandbox_settings() -> dict:
         return {}
 
 
+def required_host_paths(
+    *,
+    monorepo: Path,
+    worktree_root: Path,
+    skill_packs_root: Path | None = None,
+    monorepo_mirror: Path | None = None,
+    shopify_auth_dir: Path | None = None,
+    agent_repos_root: Path | None = None,
+) -> list[str]:
+    """Every host path ``~/.sandbox.toml``'s ``allowed_host_paths`` must list.
+
+    The SINGLE source of truth for that list — both ``diagnose()``'s check and
+    the "Bổ sung đường dẫn" fix action (``write_sandbox_config``, called from
+    ``service.py``'s ``/setup/fix/write_sandbox_config`` route) must build it
+    from here rather than keeping their own copies. They used to: the fix
+    action's copy quietly fell out of sync and dropped ``agent_repos_root``,
+    so clicking the button rewrote the file still missing the one path the
+    check was actually complaining about — an unfixable "fix", found live.
+    """
+    required = [str(monorepo), str(worktree_root), str(Path.home() / ".nvm"),
+                str(Path.home() / ".claude")]
+    if skill_packs_root is not None:
+        # Only required once a pack is actually mounted — the sandbox has no
+        # opinion on a directory it never binds — but listing it here means
+        # the same "Tạo file cấu hình" fix that repairs everything else also
+        # covers this path, instead of a second silent-rejection bug to find.
+        required.append(str(skill_packs_root))
+    if monorepo_mirror is not None:
+        # The filtered mirror sandbox_runner mounts instead of the real
+        # monorepo (see its module docstring) — a sibling directory, so it
+        # needs its own entry in the allowlist.
+        required.append(str(monorepo_mirror))
+    if shopify_auth_dir is not None:
+        # A ticket touching the cms repo activates staging-verify with no
+        # marker and no approval step (see mapping.touches_ui_repo) — so
+        # this path being missing from the allowlist is a silent failure
+        # waiting to happen on the very next such ticket, not a hypothetical.
+        required.append(str(shopify_auth_dir))
+    if agent_repos_root is not None:
+        # workspace.prepare() branches every worktree from here whenever the
+        # mirror exists, and the resulting worktree's ``.git`` file is a
+        # pointer straight back to this absolute host path — sandbox_runner
+        # mounts it at the identical path for exactly that reason (see its
+        # own _volumes() comment). Missing from the allowlist meant every
+        # git command run from inside such a worktree failed outright; found
+        # live on a real run, not hypothetical like the comment above reads.
+        required.append(str(agent_repos_root))
+    return required
+
+
 def check_sandbox_config(required_paths: list[str]) -> Step:
     if not SANDBOX_CONFIG.exists():
         return Step(
@@ -511,34 +561,14 @@ def diagnose(
     include_staging: bool = False,
 ) -> list[Step]:
     """Run every check, converting a crash into a reportable failure."""
-    required = [str(monorepo), str(worktree_root), str(Path.home() / ".nvm"),
-                str(Path.home() / ".claude")]
-    if skill_packs_root is not None:
-        # Only required once a pack is actually mounted — the sandbox has no
-        # opinion on a directory it never binds — but listing it here means
-        # the same "Tạo file cấu hình" fix that repairs everything else also
-        # covers this path, instead of a second silent-rejection bug to find.
-        required.append(str(skill_packs_root))
-    if monorepo_mirror is not None:
-        # The filtered mirror sandbox_runner mounts instead of the real
-        # monorepo (see its module docstring) — a sibling directory, so it
-        # needs its own entry in the allowlist.
-        required.append(str(monorepo_mirror))
-    if shopify_auth_dir is not None:
-        # A ticket touching the cms repo activates staging-verify with no
-        # marker and no approval step (see mapping.touches_ui_repo) — so
-        # this path being missing from the allowlist is a silent failure
-        # waiting to happen on the very next such ticket, not a hypothetical.
-        required.append(str(shopify_auth_dir))
-    if agent_repos_root is not None:
-        # workspace.prepare() branches every worktree from here whenever the
-        # mirror exists, and the resulting worktree's ``.git`` file is a
-        # pointer straight back to this absolute host path — sandbox_runner
-        # mounts it at the identical path for exactly that reason (see its
-        # own _volumes() comment). Missing from the allowlist meant every
-        # git command run from inside such a worktree failed outright; found
-        # live on a real run, not hypothetical like the comment above reads.
-        required.append(str(agent_repos_root))
+    required = required_host_paths(
+        monorepo=monorepo,
+        worktree_root=worktree_root,
+        skill_packs_root=skill_packs_root,
+        monorepo_mirror=monorepo_mirror,
+        shopify_auth_dir=shopify_auth_dir,
+        agent_repos_root=agent_repos_root,
+    )
     probes = [
         lambda: check_docker(),
         lambda: check_sandbox_config(required),
