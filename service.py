@@ -115,7 +115,29 @@ def port() -> int:
 
 
 def bam_url() -> str:
+    """BAM's address for THIS PROCESS to call — server-to-server, never seen
+    by a browser. Correct as ``http://localhost:8000`` whenever this service
+    and BAM run on the same host, which is the common case; see
+    ``bam_public_url()`` for the separate address a browser needs.
+    """
     return os.environ.get("BAM_URL", "http://localhost:8000").rstrip("/")
+
+
+def bam_public_url() -> str:
+    """BAM's address for the BROWSER to follow — the "BAM console"/"Agent
+    Routine" links in the sidebar, and the same link inside the stale-trigger
+    banner (see trigger_health()).
+
+    Deliberately separate from bam_url(): that one is correct as
+    ``http://localhost:8000`` for this service's own server-to-server calls
+    into BAM on the same host, and exactly as wrong for a browser link as
+    ``DEFAULT_SERVICE_URL`` was for this service's own sidebar entry in
+    plugin.py — same bug, same fix, just the other direction (this service
+    linking OUT to BAM instead of BAM linking IN to this service). Defaults
+    to ``bam_url()`` so a deployment that never sets this stays byte-identical
+    to today.
+    """
+    return os.environ.get("BAM_PUBLIC_URL", bam_url()).rstrip("/")
 
 
 def base_path() -> str:
@@ -403,7 +425,7 @@ def trigger_health() -> dict:
     return {
         "idle_minutes": None if idle is None else int(idle),
         "stale": bool(stale),
-        "routine_url": f"{bam_url()}/agent-routine",
+        "routine_url": f"{bam_public_url()}/agent-routine",
     }
 
 
@@ -421,7 +443,7 @@ def _shell(request: Request, **context) -> dict:
     return {
         "request": request,
         "port": port(),
-        "bam_url": bam_url(),
+        "bam_url": bam_public_url(),
         "base_path": base_path(),
         **context,
     }
