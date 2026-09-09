@@ -88,6 +88,25 @@ def find_claude_binary() -> str:
     return str(matches[-1]) if matches else ""
 
 
+def find_claude_bin_dir() -> Path | None:
+    """Host directory to mount into the sandbox and put on PATH — the single
+    place both sandbox_runner._resolve_claude_bin_dir() (what actually gets
+    mounted) and setup_wizard.required_host_paths() (what ~/.sandbox.toml's
+    allowlist must include for that mount to be permitted) resolve this from.
+
+    Calling ``.resolve()`` matters here, not just cosmetic: Anthropic's native
+    installer (``curl -fsSL https://claude.ai/install.sh | bash``) leaves
+    ``claude`` on PATH as a symlink (e.g. ``~/.local/bin/claude``) pointing at
+    a DIFFERENT real directory (``~/.local/share/claude/versions/<ver>``).
+    OpenSandbox mounts and allowlists real host paths, not symlinks — passing
+    the symlink's own parent through unresolved would silently mount an empty
+    or wrong directory instead of raising, found live only once the sandbox
+    itself reported ``claude: command not found`` from inside the container.
+    """
+    binary = find_claude_binary()
+    return Path(binary).resolve().parent if binary else None
+
+
 def _check_claude() -> Check:
     binary = find_claude_binary()
     return Check(

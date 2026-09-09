@@ -392,32 +392,24 @@ def _clear_stale_chrome_singleton_files(profile: Path) -> None:
 
 def _resolve_claude_bin_dir() -> Path | None:
     """Host directory holding ``claude`` — mounted into the sandbox and put on
-    PATH ahead of everything else, resolved the SAME way the Setup page's own
-    "Claude CLI" check does (``preflight.find_claude_binary()``: an explicit
-    ``BLOY_CLAUDE_BIN``, then plain ``PATH``, then the newest nvm-installed
-    copy) so the two can never again disagree about where it is.
+    PATH ahead of everything else.
 
-    They used to: this used to hardcode a specific nvm/node version and mount
-    the whole ``~/.nvm`` tree, independently of what the Setup check actually
-    looked at. That drifted from reality in two ways, both found live on a
-    fresh production install — an nvm-installed CLI under a DIFFERENT node
-    version than the pin (the check passed, the mount pointed at a directory
-    that did not exist), and Anthropic's native installer
-    (``curl -fsSL https://claude.ai/install.sh | bash``, a single
-    self-contained binary that needs no ``node`` runtime alongside it at all)
-    landing outside ``~/.nvm`` entirely — the check reported "ok" from plain
-    ``PATH``, but the sandbox mounted ``~/.nvm`` regardless and the container
-    failed with ``claude: command not found``. Mounting whatever directory
-    this same resolution actually found removes that whole class of drift.
-
-    Returns ``None`` when nothing is found on the host either — the honest
-    behaviour then is to mount nothing and leave PATH untouched, not to guess
-    at a directory that does not exist.
+    A thin re-export of ``preflight.find_claude_bin_dir()`` — kept as its own
+    name here (rather than calling that one directly at each use site) only so
+    the existing tests and call sites in this module do not all need to change
+    name. ``setup_wizard.required_host_paths()`` calls the SAME
+    ``preflight`` function to decide what ``~/.sandbox.toml``'s
+    ``allowed_host_paths`` must include — see that function's docstring for
+    why sharing one resolver here matters: this used to hardcode a specific
+    nvm/node version and mount the whole ``~/.nvm`` tree instead, which
+    drifted from what the Setup page's own check looked at and, separately,
+    from what the allowlist permitted — both found live on a fresh production
+    install, both surfacing as the sandbox failing after everything on the
+    Setup page reported "ok".
     """
-    from bloy_dev_agent.preflight import find_claude_binary
+    from bloy_dev_agent.preflight import find_claude_bin_dir
 
-    binary = find_claude_binary()
-    return Path(binary).resolve().parent if binary else None
+    return find_claude_bin_dir()
 
 
 def _volumes(
