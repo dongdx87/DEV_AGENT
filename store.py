@@ -61,6 +61,12 @@ SETTING_GIT_REMOTE = "git_remote"
 SETTING_SKILLS_ROOT = "skills_root"
 SETTING_ENABLED_SKILLS = "enabled_skills"
 
+#: Silences the human-facing report comment on Twenty without touching
+#: anything else the pipeline does — claiming, moving columns, opening MRs all
+#: still happen exactly the same. For debugging a real issue (repeated resets,
+#: repeated failures) without spamming its comment thread on every retry.
+SETTING_COMMENTS_DISABLED = "comments_disabled"
+
 
 def _now() -> datetime:
     return datetime.now(UTC)
@@ -101,6 +107,16 @@ def save_settings(values: dict[str, str]) -> None:
         raise
     finally:
         session.close()
+
+
+def comments_disabled() -> bool:
+    """Whether ``_comment()`` should skip posting to Twenty entirely.
+
+    Off by default — a run's report comment is the only thing a reviewer sees
+    without opening this service's own dashboard.
+    """
+    raw = get_settings().get(SETTING_COMMENTS_DISABLED, "").strip().lower()
+    return raw in {"1", "true", "on", "yes"}
 
 
 def max_attempts() -> int:

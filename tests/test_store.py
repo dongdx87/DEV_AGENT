@@ -69,6 +69,26 @@ def test_saving_one_setting_leaves_the_others_alone(db):
     assert saved[store.SETTING_MAX_ATTEMPTS] == "4"
 
 
+def test_comments_disabled_defaults_to_off(db):
+    assert store.comments_disabled() is False
+
+
+@pytest.mark.parametrize("value", ["on", "1", "true", "YES"])
+def test_comments_disabled_reads_the_saved_value(db, value):
+    store.save_settings({store.SETTING_COMMENTS_DISABLED: value})
+
+    assert store.comments_disabled() is True
+
+
+def test_comments_disabled_turns_back_off_when_cleared(db):
+    """An unchecked checkbox submits nothing — the caller must be able to save
+    an empty string back and have that actually mean "off" again."""
+    store.save_settings({store.SETTING_COMMENTS_DISABLED: "on"})
+    store.save_settings({store.SETTING_COMMENTS_DISABLED: ""})
+
+    assert store.comments_disabled() is False
+
+
 # ---------------------------------------------------------------------------
 # Attempt cap
 # ---------------------------------------------------------------------------

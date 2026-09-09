@@ -551,6 +551,7 @@ def create_app() -> FastAPI:
         error_status: str = Form(default=""),
         blocked_status: str = Form(default=""),
         timeout_minutes: str = Form(default=""),
+        comments_disabled: str = Form(default=""),
     ):
         store.save_settings(
             {
@@ -563,6 +564,10 @@ def create_app() -> FastAPI:
                 store.SETTING_ERROR_STATUS: error_status.strip(),
                 store.SETTING_BLOCKED_STATUS: blocked_status.strip(),
                 store.SETTING_TIMEOUT_MINUTES: timeout_minutes.strip(),
+                # An unchecked checkbox submits nothing at all, not "off" —
+                # the stored value must still change to "" on that submit, or
+                # turning the toggle back off from the form would do nothing.
+                store.SETTING_COMMENTS_DISABLED: "on" if comments_disabled.strip() else "",
             }
         )
         return _redirect("/settings")

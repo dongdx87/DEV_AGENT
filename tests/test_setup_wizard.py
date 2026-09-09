@@ -131,15 +131,14 @@ def test_every_offered_fix_is_in_the_allowlist(config, tmp_path):
             assert step.fix in setup_wizard.FIXES, f"{step.key} offers {step.fix!r}"
 
 
-def test_a_skill_packs_root_is_required_only_when_given(config, monkeypatch, tmp_path):
+def test_a_skill_packs_root_is_required_only_when_given(config, tmp_path):
     """A mount OpenSandbox will reject outside the allowlist must be listed —
     but only once something actually asks for it to be mounted.
     """
-    monkeypatch.setattr("bloy_dev_agent.preflight.find_claude_mount_dirs", lambda: [])
     monorepo, worktree_root = tmp_path / "BLOY", tmp_path / "wt"
     packs_root = tmp_path / "packs"
     setup_wizard.write_sandbox_config(
-        [str(monorepo), str(worktree_root), str(Path.home() / ".claude")]
+        [str(monorepo), str(worktree_root), str(Path.home() / ".nvm"), str(Path.home() / ".claude")]
     )
 
     without_packs = setup_wizard.diagnose(
@@ -159,17 +158,16 @@ def test_a_skill_packs_root_is_required_only_when_given(config, monkeypatch, tmp
     assert str(packs_root) in step.detail
 
 
-def test_the_shopify_auth_dir_is_required_only_when_given(config, monkeypatch, tmp_path):
+def test_the_shopify_auth_dir_is_required_only_when_given(config, tmp_path):
     """A ticket touching cms activates staging-verify with no marker and no
     approval step — so this path missing from the allowlist is a silent
     failure waiting to happen, and must be flaggable the same way skill packs
     and the monorepo mirror already are.
     """
-    monkeypatch.setattr("bloy_dev_agent.preflight.find_claude_mount_dirs", lambda: [])
     monorepo, worktree_root = tmp_path / "BLOY", tmp_path / "wt"
     auth_dir = tmp_path / "shopify-auth"
     setup_wizard.write_sandbox_config(
-        [str(monorepo), str(worktree_root), str(Path.home() / ".claude")]
+        [str(monorepo), str(worktree_root), str(Path.home() / ".nvm"), str(Path.home() / ".claude")]
     )
 
     without_it = setup_wizard.diagnose(
@@ -189,17 +187,16 @@ def test_the_shopify_auth_dir_is_required_only_when_given(config, monkeypatch, t
     assert str(auth_dir) in step.detail
 
 
-def test_the_agent_repos_mirror_is_required_only_when_given(config, monkeypatch, tmp_path):
+def test_the_agent_repos_mirror_is_required_only_when_given(config, tmp_path):
     """sandbox_runner mounts this mirror at its own absolute host path so a
     worktree's ``.git`` pointer resolves inside the container — missing from
     the allowlist meant opensandbox-server silently refused that mount, and a
     real run only discovered it because git failed outright from inside.
     """
-    monkeypatch.setattr("bloy_dev_agent.preflight.find_claude_mount_dirs", lambda: [])
     monorepo, worktree_root = tmp_path / "BLOY", tmp_path / "wt"
     mirror = tmp_path / "bloy-dev-agent-repos"
     setup_wizard.write_sandbox_config(
-        [str(monorepo), str(worktree_root), str(Path.home() / ".claude")]
+        [str(monorepo), str(worktree_root), str(Path.home() / ".nvm"), str(Path.home() / ".claude")]
     )
 
     without_it = setup_wizard.diagnose(
@@ -217,46 +214,6 @@ def test_the_agent_repos_mirror_is_required_only_when_given(config, monkeypatch,
     step = next(s for s in with_it if s.key == "sandbox_config")
     assert step.state == setup_wizard.FAIL
     assert str(mirror) in step.detail
-
-
-def test_wherever_claude_resolves_to_is_required_too(config, monkeypatch, tmp_path):
-    """Found live on a fresh production install: the allowlist and the actual
-    sandbox mount used to come from two independent, hardcoded ideas of where
-    ``claude`` lives (see sandbox_runner._resolve_claude_bin_dirs's docstring)
-    — this pins that they now share one resolver, so they cannot drift apart
-    again the way "Bổ sung đường dẫn" once could not fix its own complaint.
-    Two directories, not one — a native-installer ``claude`` is a symlink
-    into a second tree, and both must be allowed or the mount is rejected.
-    """
-    bin_dir = tmp_path / "bin"
-    real_dir = tmp_path / "share" / "versions"
-    monkeypatch.setattr(
-        "bloy_dev_agent.preflight.find_claude_mount_dirs", lambda: [bin_dir, real_dir]
-    )
-    monorepo, worktree_root = tmp_path / "BLOY", tmp_path / "wt"
-    setup_wizard.write_sandbox_config(
-        [str(monorepo), str(worktree_root), str(Path.home() / ".claude")]
-    )
-
-    without_it = setup_wizard.diagnose(
-        monorepo=monorepo, worktree_root=worktree_root,
-        repos=("shopify-app-loyalty-api",), twenty_url="", twenty_key="",
-    )
-    step = next(s for s in without_it if s.key == "sandbox_config")
-    assert step.state == setup_wizard.FAIL
-    assert str(bin_dir) in step.detail
-    assert str(real_dir) in step.detail
-
-    setup_wizard.write_sandbox_config(
-        [str(monorepo), str(worktree_root), str(Path.home() / ".claude"),
-         str(bin_dir), str(real_dir)]
-    )
-    with_it = setup_wizard.diagnose(
-        monorepo=monorepo, worktree_root=worktree_root,
-        repos=("shopify-app-loyalty-api",), twenty_url="", twenty_key="",
-    )
-    step = next(s for s in with_it if s.key == "sandbox_config")
-    assert step.state == setup_wizard.OK
 
 
 # ---------------------------------------------------------------------------

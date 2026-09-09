@@ -12,14 +12,10 @@ credential the agent cannot reach is a credential it cannot leak.
 
 Mount layout::
 
-    /worktrees          <- host worktree root  (read-write, the only one)
-    /monorepo           <- monorepo root       (read-only, CLAUDE.md + sibling projects)
-    /opt/claude-bin-N   <- dir(s) making `claude` runnable (read-only, one or two, only
-                           if the host has one — see preflight.find_claude_mount_dirs();
-                           NOT the host's own path — see CLAUDE_BIN_MOUNT_PREFIX)
-    /opt/claude-shim    <- setup-script-created symlink literally named `claude`,
-                           pointing into claude-bin-N (see _claude_shim_lines)
-    /skill-packs        <- shared skill store  (read-only, only if any pack is enabled)
+    /worktrees      <- host worktree root   (read-write, the only one)
+    /monorepo       <- monorepo root        (read-only, CLAUDE.md + sibling projects)
+    /opt/nvm        <- host nvm             (read-only, node + the claude CLI)
+    /skill-packs    <- shared skill store   (read-only, only if any pack is enabled)
 
 ``~/.claude`` is deliberately **not** mounted or copied wholesale — that
 directory also holds OAuth refresh tokens for four MCP servers this pipeline
@@ -73,7 +69,7 @@ STAGING_IMAGE = "bloy-dev-agent/sandbox-chromium:v1"
 #: — a real staging-verify run hit exactly that: "Chromium distribution
 #: 'chrome' is not found at /opt/google/chrome/chrome", and the agent user has
 #: no permission to `npx playwright install chrome` to fix it itself. Pinned
-#: to an exact revision on purpose — bump this alongside sandbox_image/Dockerfile
+#: the same way NODE_VERSION is — bump this alongside sandbox_image/Dockerfile
 #: if it ever installs a different Playwright/Chromium revision.
 STAGING_CHROMIUM_EXECUTABLE = "/opt/ms-playwright/chromium-1237/chrome-linux64/chrome"
 
@@ -142,17 +138,7 @@ STAGING_EGRESS_ALLOW: tuple[str, ...] = (
 )
 
 WORKTREE_MOUNT = "/worktrees"
-#: Each host directory that makes ``claude`` runnable is mounted read-only at
-#: ``{CLAUDE_BIN_MOUNT_PREFIX}{index}``. Deliberately NOT the host's own
-#: absolute path: the native installer lives under ``$HOME``, which on the
-#: production host is ``/root`` — a directory every image already ships as
-#: mode 700, so mounting there leaves the unprivileged agent user unable to
-#: traverse in at all (verified against the real image, not assumed).
-CLAUDE_BIN_MOUNT_PREFIX = "/opt/claude-bin-"
-#: Writable dir the setup script creates, holding the one symlink actually
-#: named ``claude``. First on PATH so it wins over a same-named but
-#: unresolvable symlink that may sit in a mounted source directory.
-CLAUDE_SHIM_DIR = "/opt/claude-shim"
+NVM_MOUNT = "/opt/nvm"
 #: Monorepo root, read-only, so the agent can read CLAUDE.md and sibling projects.
 MONOREPO_MOUNT = "/monorepo"
 
@@ -231,7 +217,12 @@ MONOREPO_MIRROR_EXCLUDES = (
 #: enabled — an empty mount would just be a mkdir nobody asked for.
 SKILLS_MOUNT = "/skill-packs"
 
+#: Node release that carries the Claude CLI on this host. Pinned rather than
+#: globbed because the container must not silently pick up a different one.
+NODE_VERSION = "v20.20.2"
+
 SANDBOX_CONFIG = Path.home() / ".sandbox.toml"
+HOST_NVM = Path.home() / ".nvm"
 HOST_CLAUDE_JSON = Path.home() / ".claude.json"
 #: Where the actual OAuth tokens live — never mounted or copied whole (see
 #: module docstring); only its ``claudeAiOauth`` key is ever read out of it.
@@ -240,18 +231,9 @@ HOST_CLAUDE_CREDENTIALS = Path.home() / ".claude" / ".credentials.json"
 #: Unprivileged user created inside the container. The uid matches the host
 #: user so files written into the bind-mounted worktree come back owned by the
 #: person who has to review them, not by root.
-#:
-#: Except when the service itself runs as root, which is how it is deployed on
-#: the production host: mirroring uid 0 into the container makes the agent
-#: *root in there too*, and the CLI refuses ``--dangerously-skip-permissions``
-#: under root outright — found live, the run failed on exactly that message.
-#: 1000 is the conventional first human uid and the one base images already
-#: ship, so it is the safest stand-in. Nothing is lost by not mirroring here:
-#: the reason to mirror is that the host user must be able to manage files the
-#: container wrote, and root already can, whoever owns them.
 AGENT_USER = "bloy"
-AGENT_UID = os.getuid() or 1000
-AGENT_GID = os.getgid() or 1000
+AGENT_UID = os.getuid()
+AGENT_GID = os.getgid()
 AGENT_HOME = f"/home/{AGENT_USER}"
 
 #: The prompt is delivered as a file and piped in, never interpolated into the
@@ -410,49 +392,12 @@ def _clear_stale_chrome_singleton_files(profile: Path) -> None:
         (profile / name).unlink(missing_ok=True)
 
 
-def _resolve_claude_bin_dirs() -> list[Path]:
-    """One or two host directories that make ``claude`` findable AND runnable
-    inside the sandbox — mounted each at its OWN absolute host path, and the
-    FIRST one put on PATH ahead of everything else.
-
-    A thin re-export of ``preflight.find_claude_mount_dirs()`` — kept as its
-    own name here (rather than calling that one directly at each use site)
-    only so the existing tests and call sites in this module do not all need
-    to change name. ``setup_wizard.required_host_paths()`` calls the SAME
-    ``preflight`` function to decide what ``~/.sandbox.toml``'s
-    ``allowed_host_paths`` must include — see that function's docstring for
-    why sharing one resolver here matters, and for why this can be two
-    directories rather than one (Anthropic's native installer's ``claude`` is
-    a symlink into a completely different tree).
-    """
-    from bloy_dev_agent.preflight import find_claude_mount_dirs
-
-    return find_claude_mount_dirs()
-
-
-def _claude_container_exec(claude_bin_dirs: list[Path]) -> str:
-    """Where the real ``claude`` file lands inside the container, or "".
-
-    The mount list ends with the resolved executable's own directory (see
-    preflight.find_claude_mount_dirs), and _volumes() mounts entry ``i`` at
-    ``{CLAUDE_BIN_MOUNT_PREFIX}{i}`` — so the last index is where the file
-    itself is, whatever the host called it.
-    """
-    from bloy_dev_agent.preflight import find_claude_executable
-
-    executable = find_claude_executable()
-    if executable is None or not claude_bin_dirs:
-        return ""
-    return f"{CLAUDE_BIN_MOUNT_PREFIX}{len(claude_bin_dirs) - 1}/{executable.name}"
-
-
 def _volumes(
     worktree_root: Path,
     monorepo: Path | None = None,
     skill_packs_root: Path | None = None,
     shopify_auth_dir: Path | None = None,
     agent_repos_root: Path | None = None,
-    claude_bin_dirs: list[Path] | None = None,
 ):
     from opensandbox.models.sandboxes import Host, Volume
 
@@ -462,19 +407,10 @@ def _volumes(
             host=Host(path=str(worktree_root)),
             mount_path=WORKTREE_MOUNT,
         ),
+        Volume(
+            name="nvm", host=Host(path=str(HOST_NVM)), mount_path=NVM_MOUNT, read_only=True
+        ),
     ]
-    # At a path of our own choosing, NOT the host's own absolute path (see
-    # CLAUDE_BIN_MOUNT_PREFIX). The setup script re-creates the `claude` name
-    # itself rather than relying on the host's symlink resolving in here.
-    for index, claude_dir in enumerate(claude_bin_dirs or []):
-        volumes.append(
-            Volume(
-                name=f"claude-cli-{index}",
-                host=Host(path=str(claude_dir)),
-                mount_path=f"{CLAUDE_BIN_MOUNT_PREFIX}{index}",
-                read_only=True,
-            )
-        )
 
     # workspace.prepare() branches worktrees from this mirror whenever it
     # exists, never from the developer's own checkout (see its own docstring).
@@ -834,26 +770,6 @@ def _skill_copy_lines(
     return lines
 
 
-def _claude_shim_lines(claude_exec: str) -> list[str]:
-    """Give the mounted executable the name ``claude`` on a PATH directory.
-
-    The file inside the mount is named after its version, not "claude" (see
-    preflight.find_claude_executable), so simply putting the mount on PATH
-    finds nothing — the sandbox reported ``claude: command not found`` on a
-    real run for exactly that reason. Recreating the name here also means the
-    host's own symlink never has to resolve inside the container, which it
-    cannot: it points at an absolute host path under a mode-700 ``/root``.
-    """
-    if not claude_exec:
-        return []
-    return [
-        f"mkdir -p {CLAUDE_SHIM_DIR}",
-        f"ln -sf {shlex.quote(claude_exec)} {CLAUDE_SHIM_DIR}/claude",
-        # The agent user is not root and does not own this directory.
-        f"chmod 755 {CLAUDE_SHIM_DIR}",
-    ]
-
-
 def _setup_script(
     prompt: str,
     enabled_skills: list[skill_packs.SkillPack] | None = None,
@@ -861,7 +777,6 @@ def _setup_script(
     run_id: str = "",
     staging: bool = False,
     shopify_auth_dir: Path | None = None,
-    claude_exec: str = "",
 ) -> str:
     """Create the agent user, install its Claude login, and drop the prompt in.
 
@@ -935,24 +850,9 @@ def _setup_script(
             f'printf \'%s\' {shlex.quote(_b64(claude_json))} | base64 -d > "$h/.claude.json"',
             f"printf '%s' {shlex.quote(_b64(prompt))} | base64 -d > {PROMPT_PATH}",
             f"chmod 644 {PROMPT_PATH}",
-            *_claude_shim_lines(claude_exec),
             *skill_lines,
             *mcp_lines,
-            # The home directory itself, NOT recursively: the agent user needs
-            # to own it to traverse into it at all (in this image $h is /root,
-            # mode 700), but recursing from here is what broke — see below.
-            f'chown {AGENT_UID}:{AGENT_GID} "$h"',
-            # Then exactly what this script wrote as root, and nothing else.
-            # This used to be a single blanket ``chown -R "$h"``, which broke
-            # the moment a read-only bind mount landed anywhere under $HOME:
-            # a native-install `claude` sits at /root/.local/... (see
-            # _resolve_claude_bin_dirs) and chown cannot touch a read-only
-            # mount, so under `set -e` the first such file aborted the whole
-            # setup. Narrower is also simply more correct: nothing here has
-            # any business re-owning files it did not create. (`chown -x`
-            # would skip mounts, but this image's BusyBox chown has no such
-            # flag — found live, one failed run apart.)
-            f'chown -R {AGENT_UID}:{AGENT_GID} "$h/.claude" "$h/.claude.json"',
+            f'chown -R {AGENT_UID}:{AGENT_GID} "$h"',
             'test -s "$h/.claude/.credentials.json" || echo NO_CREDENTIALS',
         ]
     )
@@ -978,7 +878,7 @@ async def _run_async(
     from opensandbox import Sandbox
 
     workdir = container_path(worktree, worktree_root)
-    claude_bin_dirs = _resolve_claude_bin_dirs()
+    node_bin = f"{NVM_MOUNT}/versions/node/{NODE_VERSION}/bin"
 
     # Mount the filtered mirror, never the real monorepo — see
     # sync_monorepo_mirror's docstring for why.
@@ -1001,7 +901,7 @@ async def _run_async(
         connection_config=_connection(),
         volumes=_volumes(
             worktree_root, monorepo_mount, skill_packs_root, shopify_auth_dir,
-            agent_repos_root, claude_bin_dirs,
+            agent_repos_root,
         ),
         metadata={"owner": OWNER_TAG, "run_id": run_id or "adhoc"},
         network_policy=_network_policy(STAGING_EGRESS_ALLOW) if staging else None,
@@ -1010,12 +910,10 @@ async def _run_async(
     sandbox_id = getattr(sandbox, "sandbox_id", "") or getattr(sandbox, "id", "")
     logger.info("bloy_dev_agent: sandbox %s working in %s", sandbox_id, workdir)
 
-    claude_exec = _claude_container_exec(claude_bin_dirs)
     try:
         setup = await sandbox.commands.run(
             _setup_script(
-                prompt, enabled_skills, skill_packs_root, run_id, staging, shopify_auth_dir,
-                claude_exec,
+                prompt, enabled_skills, skill_packs_root, run_id, staging, shopify_auth_dir
             )
         )
         setup_output = _text(setup)
@@ -1042,17 +940,8 @@ async def _run_async(
         # separate `sandbox.commands.run` calls — a background process from
         # the first would not survive into the second.
         xvfb_prefix = _xvfb_prefix(chrome_profile is not None)
-        # CLAUDE_SHIM_DIR first (the actual "claude" name the setup script
-        # created); mount 0 next — for an nvm-installed CLI (a shebang script,
-        # not a self-contained binary) that is also where `node` lives, which
-        # the shebang needs on PATH to run at all.
-        path_value = (
-            f"{CLAUDE_SHIM_DIR}:{CLAUDE_BIN_MOUNT_PREFIX}0:$PATH"
-            if claude_exec
-            else "$PATH"
-        )
         inner = (
-            f"export PATH={path_value} CI=true{_token_export(staging_token)}; "
+            f"export PATH={node_bin}:$PATH CI=true{_token_export(staging_token)}; "
             f"{xvfb_prefix}"
             f"cd {shlex.quote(workdir)} && "
             f"cat {PROMPT_PATH} | claude -p {flags}{redirect}"

@@ -242,7 +242,7 @@ def release_stranded_issues(
 
 def _comment(client: TwentyClient, issue_id: str, text: str) -> str:
     """Post the report; return the new comment's id, or "" if none was posted."""
-    if not COMMENTS_ENABLED:
+    if not COMMENTS_ENABLED or store.comments_disabled():
         return ""
     try:
         record = client.create_record(

@@ -291,6 +291,24 @@ def test_a_successful_run_reports_the_merge_request(monkeypatch, monorepo, tmp_p
     assert "https://gitlab/mr/9" in client.comments[0]
 
 
+def test_comments_disabled_setting_silences_the_report_but_not_the_run(
+    monkeypatch, monorepo, tmp_path
+):
+    """Everything else about the run must stay exactly the same — claiming,
+    moving columns, opening the MR — only the human-facing comment is skipped.
+    Used to debug a real issue (repeated resets) without spamming its thread.
+    """
+    monkeypatch.setattr(pipeline.store, "comments_disabled", lambda: True)
+    ok = pipeline.sandbox_runner.SandboxResult(True, "đã sửa", "sb-1", 0)
+
+    client, outcome = _run(monkeypatch, monorepo, tmp_path, sandbox_result=ok, changed=True)
+
+    assert (outcome.ok, outcome.stage) == (True, "done")
+    assert outcome.merge_request_url == "https://gitlab/mr/9"
+    assert outcome.moved_to == "In Review"
+    assert client.comments == []
+
+
 def test_the_issue_is_claimed_before_the_agent_runs(monkeypatch, monorepo, tmp_path):
     """The claim is the only lock; it has to land before any work starts."""
     ok = pipeline.sandbox_runner.SandboxResult(True, "đã sửa", "sb-1", 0)

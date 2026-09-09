@@ -50,6 +50,25 @@
       </div>
     </section>
 
+    {# ---------- comments ---------- #}
+    <section class="rounded-2xl border border-slate-200 bg-white shadow-sm p-5">
+      <label class="flex items-start gap-3 cursor-pointer">
+        <input type="checkbox" name="comments_disabled" value="on"
+               {% if settings.get("comments_disabled") %}checked{% endif %}
+               class="mt-1 h-4 w-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500/40">
+        <span>
+          <span class="block text-sm font-semibold text-slate-900">Tạm tắt comment lên Twenty</span>
+          <span class="mt-1 block text-sm text-slate-500 max-w-prose">
+            Agent vẫn claim, đổi cột, mở merge request như bình thường — chỉ
+            không đăng comment báo cáo lên issue nữa. Dùng khi đang debug 1
+            issue thật (reset/chạy lại nhiều lần) để khỏi spam comment vào
+            đúng ticket đó; xem tiến trình ở Dashboard/run detail thay vì
+            Twenty trong lúc bật.
+          </span>
+        </span>
+      </label>
+    </section>
+
     {# ---------- source ---------- #}
     <section class="rounded-2xl border border-slate-200 bg-white shadow-sm p-5 space-y-4">
       <div>

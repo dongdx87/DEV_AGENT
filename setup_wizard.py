@@ -155,22 +155,8 @@ def required_host_paths(
     so clicking the button rewrote the file still missing the one path the
     check was actually complaining about — an unfixable "fix", found live.
     """
-    from bloy_dev_agent.preflight import find_claude_mount_dirs
-
-    required = [str(monorepo), str(worktree_root), str(Path.home() / ".claude")]
-    # Wherever preflight.find_claude_mount_dirs() resolves ``claude`` to — the
-    # SAME function sandbox_runner._resolve_claude_bin_dirs() calls to decide
-    # what to mount (one or two directories; see that function's docstring for
-    # why it can be two — a native-installer ``claude`` is a symlink into a
-    # second tree). Used to be a hardcoded ``~/.nvm``, always listed whether
-    # or not anything actually lived there; that drifted from the real mount
-    # in two ways, both found live on a fresh production install: an
-    # nvm-installed CLI under a different node version than sandbox_runner
-    # once pinned, and Anthropic's native installer landing outside ``~/.nvm``
-    # entirely. Either way the allowlist was checking a directory nothing
-    # actually used, while the real one(s) the sandbox tried to mount stayed
-    # unlisted and got rejected.
-    required.extend(str(d) for d in find_claude_mount_dirs())
+    required = [str(monorepo), str(worktree_root), str(Path.home() / ".nvm"),
+                str(Path.home() / ".claude")]
     if skill_packs_root is not None:
         # Only required once a pack is actually mounted — the sandbox has no
         # opinion on a directory it never binds — but listing it here means
