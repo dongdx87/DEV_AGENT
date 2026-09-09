@@ -132,19 +132,25 @@ def test_setup_adopts_an_existing_uid_instead_of_creating_a_second_user():
     assert 'if [ -z "$u" ]; then' in script
 
 
-def test_the_home_chown_never_descends_into_a_bind_mount():
-    """$h can now hold a read-only bind mount nested under it (a native-install
-    `claude` lands under $HOME's own tree — see _resolve_claude_bin_dirs).
-    `chown` cannot touch a read-only mount, and this script runs under
-    `set -e`, so without ``-x`` the very first such directory would abort the
-    whole setup script — found live the moment the sandbox mount fix landed.
+def test_the_chown_touches_only_what_the_script_itself_wrote():
+    """$h can hold a read-only bind mount nested under it (a native-install
+    `claude` lands under $HOME's own tree, and $h is /root in this image — see
+    _resolve_claude_bin_dirs). chown cannot touch a read-only mount, and this
+    script runs under `set -e`, so a blanket ``chown -R "$h"`` aborted the whole
+    setup on the first such file — found live the moment the mount fix landed.
     """
     script = sandbox_runner._setup_script("do the thing")
 
-    home_chown = next(line for line in script.splitlines() if line.strip().startswith("chown"))
-    assert home_chown.split() == [
-        "chown", "-R", "-x", f"{sandbox_runner.AGENT_UID}:{sandbox_runner.AGENT_GID}", '"$h"',
+    owner = f"{sandbox_runner.AGENT_UID}:{sandbox_runner.AGENT_GID}"
+    chowns = [line for line in script.splitlines() if line.strip().startswith("chown")]
+    assert chowns == [
+        # The home dir itself must still change hands — in this image it is
+        # /root, mode 700, and the agent user cannot even traverse into it
+        # otherwise — but only itself, never recursively.
+        f'chown {owner} "$h"',
+        f'chown -R {owner} "$h/.claude" "$h/.claude.json"',
     ]
+    assert f'chown -R {owner} "$h"' not in script
 
 
 def test_the_monorepo_is_mounted_read_only_for_the_map(tmp_path):

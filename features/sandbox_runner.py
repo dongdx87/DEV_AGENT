@@ -880,15 +880,21 @@ def _setup_script(
             f"chmod 644 {PROMPT_PATH}",
             *skill_lines,
             *mcp_lines,
-            # -x/--one-file-system: $h can now contain a read-only bind mount
-            # nested under it (see _resolve_claude_bin_dirs — a native-install
-            # `claude` lands under $HOME's own tree, e.g. /root/.local/...), and
-            # chown cannot change ownership on a read-only mount. A bind mount
-            # is a distinct filesystem from stat's point of view, so -x simply
-            # never descends into it instead of aborting the whole script
-            # (this runs under `set -e`) on the first "Read-only file system"
-            # error — found live the moment the sandbox mount fix above landed.
-            f'chown -R -x {AGENT_UID}:{AGENT_GID} "$h"',
+            # The home directory itself, NOT recursively: the agent user needs
+            # to own it to traverse into it at all (in this image $h is /root,
+            # mode 700), but recursing from here is what broke — see below.
+            f'chown {AGENT_UID}:{AGENT_GID} "$h"',
+            # Then exactly what this script wrote as root, and nothing else.
+            # This used to be a single blanket ``chown -R "$h"``, which broke
+            # the moment a read-only bind mount landed anywhere under $HOME:
+            # a native-install `claude` sits at /root/.local/... (see
+            # _resolve_claude_bin_dirs) and chown cannot touch a read-only
+            # mount, so under `set -e` the first such file aborted the whole
+            # setup. Narrower is also simply more correct: nothing here has
+            # any business re-owning files it did not create. (`chown -x`
+            # would skip mounts, but this image's BusyBox chown has no such
+            # flag — found live, one failed run apart.)
+            f'chown -R {AGENT_UID}:{AGENT_GID} "$h/.claude" "$h/.claude.json"',
             'test -s "$h/.claude/.credentials.json" || echo NO_CREDENTIALS',
         ]
     )
