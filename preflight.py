@@ -88,23 +88,46 @@ def find_claude_binary() -> str:
     return str(matches[-1]) if matches else ""
 
 
-def find_claude_bin_dir() -> Path | None:
-    """Host directory to mount into the sandbox and put on PATH — the single
-    place both sandbox_runner._resolve_claude_bin_dir() (what actually gets
-    mounted) and setup_wizard.required_host_paths() (what ~/.sandbox.toml's
-    allowlist must include for that mount to be permitted) resolve this from.
+def find_claude_mount_dirs() -> list[Path]:
+    """Host directories to mount into the sandbox, at their OWN absolute
+    paths, so ``claude`` is both findable on PATH and actually runnable —
+    the single place both sandbox_runner._resolve_claude_bin_dirs() (what
+    actually gets mounted) and setup_wizard.required_host_paths() (what
+    ``~/.sandbox.toml``'s allowlist must include for those mounts to be
+    permitted) resolve this from.
 
-    Calling ``.resolve()`` matters here, not just cosmetic: Anthropic's native
-    installer (``curl -fsSL https://claude.ai/install.sh | bash``) leaves
-    ``claude`` on PATH as a symlink (e.g. ``~/.local/bin/claude``) pointing at
-    a DIFFERENT real directory (``~/.local/share/claude/versions/<ver>``).
-    OpenSandbox mounts and allowlists real host paths, not symlinks — passing
-    the symlink's own parent through unresolved would silently mount an empty
-    or wrong directory instead of raising, found live only once the sandbox
-    itself reported ``claude: command not found`` from inside the container.
+    Anthropic's native installer (``curl -fsSL https://claude.ai/install.sh |
+    bash``) leaves ``claude`` on PATH as a symlink — e.g.
+    ``~/.local/bin/claude`` pointing at an ABSOLUTE host path in a completely
+    different tree, ``~/.local/share/claude/versions/<ver>``. That directory
+    holds the real executable under a version NUMBER, not a file named
+    ``claude`` — so mounting only it (an earlier version of this function
+    did, via ``.resolve()``) put nothing named ``claude`` on PATH at all, and
+    the sandbox failed with ``claude: command not found`` even though the
+    mount itself succeeded. The fix needs BOTH directories, each mounted at
+    the SAME absolute path it has on the host (the same reason
+    ``agent_repos_root`` is mounted at its own absolute path in
+    ``_volumes()`` rather than an arbitrary one): the symlink's own
+    directory so ``claude`` resolves on PATH, and — only when it points
+    outside that directory — the resolved target's directory too, so the
+    symlink is not left dangling inside the container. An nvm-installed CLI
+    is typically a single non-symlink file (or a symlink within the SAME
+    directory, e.g. to a `.js` shim one level up inside the same nvm version
+    tree), so it normally yields just the one directory.
+
+    Order matters: PATH must be prefixed with the FIRST entry only — that is
+    the directory that actually has a file/symlink literally named
+    ``claude`` in it.
     """
     binary = find_claude_binary()
-    return Path(binary).resolve().parent if binary else None
+    if not binary:
+        return []
+    path = Path(binary)
+    dirs = [path.parent]
+    resolved_parent = path.resolve().parent
+    if resolved_parent != path.parent:
+        dirs.append(resolved_parent)
+    return dirs
 
 
 def _check_claude() -> Check:

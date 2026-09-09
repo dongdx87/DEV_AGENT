@@ -14,7 +14,9 @@ Mount layout::
 
     /worktrees      <- host worktree root   (read-write, the only one)
     /monorepo       <- monorepo root        (read-only, CLAUDE.md + sibling projects)
-    /opt/claude-bin <- dir holding `claude` (read-only, only if the host has one)
+    <same path as host> <- one or two dirs that make `claude` runnable (read-only,
+                        mounted at their own absolute host path — see
+                        preflight.find_claude_mount_dirs() — only if the host has one)
     /skill-packs    <- shared skill store   (read-only, only if any pack is enabled)
 
 ``~/.claude`` is deliberately **not** mounted or copied wholesale — that
@@ -138,10 +140,6 @@ STAGING_EGRESS_ALLOW: tuple[str, ...] = (
 )
 
 WORKTREE_MOUNT = "/worktrees"
-#: Where the host directory holding the ``claude`` executable (see
-#: _resolve_claude_bin_dir()) is mounted — a generic name on purpose, since
-#: that directory is not always an nvm one; see that function's docstring.
-CLAUDE_BIN_MOUNT = "/opt/claude-bin"
 #: Monorepo root, read-only, so the agent can read CLAUDE.md and sibling projects.
 MONOREPO_MOUNT = "/monorepo"
 
@@ -390,26 +388,24 @@ def _clear_stale_chrome_singleton_files(profile: Path) -> None:
         (profile / name).unlink(missing_ok=True)
 
 
-def _resolve_claude_bin_dir() -> Path | None:
-    """Host directory holding ``claude`` — mounted into the sandbox and put on
-    PATH ahead of everything else.
+def _resolve_claude_bin_dirs() -> list[Path]:
+    """One or two host directories that make ``claude`` findable AND runnable
+    inside the sandbox — mounted each at its OWN absolute host path, and the
+    FIRST one put on PATH ahead of everything else.
 
-    A thin re-export of ``preflight.find_claude_bin_dir()`` — kept as its own
-    name here (rather than calling that one directly at each use site) only so
-    the existing tests and call sites in this module do not all need to change
-    name. ``setup_wizard.required_host_paths()`` calls the SAME
+    A thin re-export of ``preflight.find_claude_mount_dirs()`` — kept as its
+    own name here (rather than calling that one directly at each use site)
+    only so the existing tests and call sites in this module do not all need
+    to change name. ``setup_wizard.required_host_paths()`` calls the SAME
     ``preflight`` function to decide what ``~/.sandbox.toml``'s
     ``allowed_host_paths`` must include — see that function's docstring for
-    why sharing one resolver here matters: this used to hardcode a specific
-    nvm/node version and mount the whole ``~/.nvm`` tree instead, which
-    drifted from what the Setup page's own check looked at and, separately,
-    from what the allowlist permitted — both found live on a fresh production
-    install, both surfacing as the sandbox failing after everything on the
-    Setup page reported "ok".
+    why sharing one resolver here matters, and for why this can be two
+    directories rather than one (Anthropic's native installer's ``claude`` is
+    a symlink into a completely different tree).
     """
-    from bloy_dev_agent.preflight import find_claude_bin_dir
+    from bloy_dev_agent.preflight import find_claude_mount_dirs
 
-    return find_claude_bin_dir()
+    return find_claude_mount_dirs()
 
 
 def _volumes(
@@ -418,7 +414,7 @@ def _volumes(
     skill_packs_root: Path | None = None,
     shopify_auth_dir: Path | None = None,
     agent_repos_root: Path | None = None,
-    claude_bin_dir: Path | None = None,
+    claude_bin_dirs: list[Path] | None = None,
 ):
     from opensandbox.models.sandboxes import Host, Volume
 
@@ -429,12 +425,17 @@ def _volumes(
             mount_path=WORKTREE_MOUNT,
         ),
     ]
-    if claude_bin_dir is not None:
+    # Mounted at its OWN absolute host path, not an arbitrary container path —
+    # same reason as agent_repos_root below: when the resolved `claude` is a
+    # symlink into a second directory, that symlink's target must resolve at
+    # the SAME absolute path inside the container as it does on the host, or
+    # it dangles.
+    for claude_dir in claude_bin_dirs or []:
         volumes.append(
             Volume(
-                name="claude-cli",
-                host=Host(path=str(claude_bin_dir)),
-                mount_path=CLAUDE_BIN_MOUNT,
+                name=f"claude-cli-{len(volumes)}",
+                host=Host(path=str(claude_dir)),
+                mount_path=str(claude_dir),
                 read_only=True,
             )
         )
@@ -905,7 +906,7 @@ async def _run_async(
     from opensandbox import Sandbox
 
     workdir = container_path(worktree, worktree_root)
-    claude_bin_dir = _resolve_claude_bin_dir()
+    claude_bin_dirs = _resolve_claude_bin_dirs()
 
     # Mount the filtered mirror, never the real monorepo — see
     # sync_monorepo_mirror's docstring for why.
@@ -928,7 +929,7 @@ async def _run_async(
         connection_config=_connection(),
         volumes=_volumes(
             worktree_root, monorepo_mount, skill_packs_root, shopify_auth_dir,
-            agent_repos_root, claude_bin_dir,
+            agent_repos_root, claude_bin_dirs,
         ),
         metadata={"owner": OWNER_TAG, "run_id": run_id or "adhoc"},
         network_policy=_network_policy(STAGING_EGRESS_ALLOW) if staging else None,
@@ -967,7 +968,7 @@ async def _run_async(
         # separate `sandbox.commands.run` calls — a background process from
         # the first would not survive into the second.
         xvfb_prefix = _xvfb_prefix(chrome_profile is not None)
-        path_value = f"{CLAUDE_BIN_MOUNT}:$PATH" if claude_bin_dir is not None else "$PATH"
+        path_value = f"{claude_bin_dirs[0]}:$PATH" if claude_bin_dirs else "$PATH"
         inner = (
             f"export PATH={path_value} CI=true{_token_export(staging_token)}; "
             f"{xvfb_prefix}"

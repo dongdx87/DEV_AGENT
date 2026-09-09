@@ -199,36 +199,62 @@ def test_no_agent_repos_root_given_mounts_nothing_extra(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_claude_bin_dir_is_the_parent_of_whatever_the_setup_check_found(monkeypatch, tmp_path):
+def test_a_plain_binary_yields_just_its_own_directory(monkeypatch, tmp_path):
+    """An nvm-installed CLI (or anything else that is not a symlink into a
+    second tree) needs only one directory mounted."""
     binary = tmp_path / "some" / "install" / "claude"
     binary.parent.mkdir(parents=True)
     binary.touch()
     monkeypatch.setattr("bloy_dev_agent.preflight.find_claude_binary", lambda: str(binary))
 
-    assert sandbox_runner._resolve_claude_bin_dir() == binary.parent
+    assert sandbox_runner._resolve_claude_bin_dirs() == [binary.parent]
 
 
-def test_no_claude_binary_found_resolves_to_none(monkeypatch):
+def test_a_symlink_into_a_second_tree_yields_both_directories(monkeypatch, tmp_path):
+    """Anthropic's native installer symlinks ``claude`` at an absolute host
+    path into a completely different directory (a version number, not a file
+    named ``claude``) — found live: mounting only the resolved target's
+    directory left nothing named ``claude`` on PATH at all.
+    """
+    real_dir = tmp_path / "share" / "claude" / "versions"
+    real_dir.mkdir(parents=True)
+    real_binary = real_dir / "1.2.3"
+    real_binary.touch()
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    symlink = bin_dir / "claude"
+    symlink.symlink_to(real_binary)
+    monkeypatch.setattr("bloy_dev_agent.preflight.find_claude_binary", lambda: str(symlink))
+
+    assert sandbox_runner._resolve_claude_bin_dirs() == [bin_dir, real_dir]
+
+
+def test_no_claude_binary_found_resolves_to_an_empty_list(monkeypatch):
     monkeypatch.setattr("bloy_dev_agent.preflight.find_claude_binary", lambda: "")
 
-    assert sandbox_runner._resolve_claude_bin_dir() is None
+    assert sandbox_runner._resolve_claude_bin_dirs() == []
 
 
-def test_a_resolved_claude_bin_dir_is_mounted_read_only(tmp_path):
-    claude_dir = tmp_path / "claude-bin"
-    claude_dir.mkdir()
+def test_claude_bin_dirs_are_each_mounted_read_only_at_their_own_host_path(tmp_path):
+    dir_a = tmp_path / "bin"
+    dir_a.mkdir()
+    dir_b = tmp_path / "share" / "versions"
+    dir_b.mkdir(parents=True)
 
-    volumes = sandbox_runner._volumes(tmp_path / "wt", claude_bin_dir=claude_dir)
+    volumes = sandbox_runner._volumes(tmp_path / "wt", claude_bin_dirs=[dir_a, dir_b])
 
-    mount = next(v for v in volumes if v.mount_path == sandbox_runner.CLAUDE_BIN_MOUNT)
-    assert mount.read_only is True
-    assert mount.host.path == str(claude_dir)
+    for claude_dir in (dir_a, dir_b):
+        mount = next(v for v in volumes if v.mount_path == str(claude_dir))
+        assert mount.read_only is True
+        assert mount.host.path == str(claude_dir)
 
 
-def test_no_claude_bin_dir_mounts_nothing_extra(tmp_path):
-    volumes = sandbox_runner._volumes(tmp_path / "wt", claude_bin_dir=None)
+def test_no_claude_bin_dirs_mounts_nothing_extra(tmp_path):
+    volumes = sandbox_runner._volumes(tmp_path / "wt", claude_bin_dirs=None)
 
-    assert all(v.mount_path != sandbox_runner.CLAUDE_BIN_MOUNT for v in volumes)
+    writable = [v.mount_path for v in volumes if not v.read_only]
+    assert writable == [sandbox_runner.WORKTREE_MOUNT]
+    assert len(volumes) == 1
 
 
 # ---------------------------------------------------------------------------
